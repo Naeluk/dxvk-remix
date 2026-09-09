@@ -355,6 +355,22 @@ namespace dxvk {
                     args.minValue = 0.0f, args.maxValue = 1.0f);
     RTX_OPTION("rtx", bool, vertexColorIsBakedLighting, true, "If true, brightness contribution will be removed from the vertex color by dividing each component by the largest component.");
     RTX_OPTION("rtx", bool, ignoreAllVertexColorBakedLighting, false, "If true, all baked lighting bound to all vertex colors will be ignored.");
+    RTX_OPTION_ARGS("rtx", float, vertexColorMinValue, 0.0f,
+                    "When Vertex Color Is Baked Lighting is off, this floors each raw vertex color channel before it is blended onto albedo, "
+                    "limiting how dark vertex color is allowed to push the surface. 0 = no floor (can go fully black), 1 = vertex color cannot darken albedo at all.",
+                    args.minValue = 0.0f, args.maxValue = 1.0f);
+    RTX_OPTION_ARGS("rtx", float, vertexColorTintAmount, 0.0f,
+                    "When Vertex Color Is Baked Lighting is off, blends albedo toward vertex color's hue while preserving the texture's own "
+                    "brightness, instead of plain multiply-darkening. 0 = stock multiply behavior, 1 = full hue reprojection.",
+                    args.minValue = 0.0f, args.maxValue = 1.0f);
+    RTX_OPTION_ARGS("rtx", float, vertexColorRoughnessInfluence, 0.0f,
+                    "When Vertex Color Is Baked Lighting is off, roughens the surface based on how dark/saturated its vertex color is "
+                    "(grime/moss heuristic). 0 = no effect on roughness.",
+                    args.minValue = 0.0f, args.maxValue = 1.0f);
+    RTX_OPTION_ARGS("rtx", float, vertexColorHeightMaskStrength, 0.0f,
+                    "On materials with a height/displacement texture, reduces vertex color mixing at brighter (raised) areas of that "
+                    "height map, leaving recesses more affected by vertex color. 0 = disabled (uniform mixing), 1 = full mask.",
+                    args.minValue = 0.0f, args.maxValue = 1.0f);
     RTX_OPTION("rtx", bool, allowFSE, false,
                "A flag indicating if the application should be able to utilize exclusive full screen mode when set to true, otherwise force it to be disabled when set to false.\n"
                "Exclusive full screen may see performance benefits over other fullscreen modes at the cost of stability in some cases.\n"

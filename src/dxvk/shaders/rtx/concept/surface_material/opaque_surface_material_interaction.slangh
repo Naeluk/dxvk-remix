@@ -693,6 +693,8 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
 
   vec4 tFactor = unorm4x8ToFloat4x32(surface.tFactor).bgra;
 
+  const vec3 albedoPreVertexColor = albedo;
+
   // WAR for REMIX-1573: texture ops for opacity should happen during baking and be skipped here for baked terrain,
   // but right now the opacity is not 1 in the baked texture where it is expected to be and thus texture ops
   // are required to blend the layer contributions properly 
@@ -700,6 +702,13 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
   if (applyTextureOperations) 
 #endif
   {
+    float vertexColorHeightMask = 1.0;
+    if (cb.vertexColorHeightMaskStrength > 0.0 && opaqueSurfaceMaterial.hasValidDisplacement()) {
+      const float rawHeightSample = textures[nonuniformEXT(uint(opaqueSurfaceMaterial.heightTextureIndex))]
+        .SampleLevel(samplers[nonuniformEXT(uint(opaqueSurfaceMaterial.samplerIndex))], surfaceInteraction.textureCoordinates, 0).r;
+      vertexColorHeightMask = lerp(1.0, saturate(1.0 - rawHeightSample), float(cb.vertexColorHeightMaskStrength));
+    }
+
     if (surface.isVertexColorBakedLighting) {
       // "Normalize" vertex color to remove lighting contribution in different vertices.
       // We assume the diffuse term contributes most lighting. Therefore, vertex color = diffuseColor * (N*L).
@@ -709,7 +718,10 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
       surfaceInteraction.vertexColor.rgb = max(surfaceInteraction.vertexColor.rgb, vec3(1.0 / 255.0));
       float maxColor = max(surfaceInteraction.vertexColor.r, max(surfaceInteraction.vertexColor.g, surfaceInteraction.vertexColor.b));
       surfaceInteraction.vertexColor.rgb /= maxColor;
-      surfaceInteraction.vertexColor.rgb = mix(vec3(1), surfaceInteraction.vertexColor.rgb, float(cb.vertexColorStrength));
+      surfaceInteraction.vertexColor.rgb = mix(vec3(1), surfaceInteraction.vertexColor.rgb, float(cb.vertexColorStrength) * vertexColorHeightMask);
+    } else {
+      surfaceInteraction.vertexColor.rgb = max(surfaceInteraction.vertexColor.rgb, vec3(cb.vertexColorMinValue));
+      surfaceInteraction.vertexColor.rgb = mix(vec3(1), surfaceInteraction.vertexColor.rgb, float(cb.vertexColorStrength) * vertexColorHeightMask);
     }
 
     // Fixed function texture stage setting
@@ -719,6 +731,14 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
     chooseTextureOperationColor(albedo, surface.textureColorOperation, textureArg1, textureArg2);
     if (surface.isTextureFactorBlend) {
       albedo *= tFactor.rgb;
+    }
+
+    if (!surface.isVertexColorBakedLighting && cb.vertexColorTintAmount > 0.0) {
+      const float preLuminance = dot(albedoPreVertexColor, vec3(0.299, 0.587, 0.114));
+      const float vertexColorLuminance = max(dot(surfaceInteraction.vertexColor.rgb, vec3(0.299, 0.587, 0.114)), 1e-4);
+      const vec3 vertexColorHue = surfaceInteraction.vertexColor.rgb / vertexColorLuminance;
+      const vec3 tintedAlbedo = preLuminance * vertexColorHue;
+      albedo = mix(albedo, tintedAlbedo, float(cb.vertexColorTintAmount));
     }
 
     // Fixed function texture stage setting (emissive)
@@ -842,6 +862,14 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
   // Apply material modifiers
   const float roughnessScale = cb.opaqueMaterialArgs.roughnessScale * (isHairCardMaterial ? cb.hairCardRoughnessScale : 1.0f);
   roughness = saturate(roughness * roughnessScale + cb.opaqueMaterialArgs.roughnessBias);
+
+  if (!surface.isVertexColorBakedLighting && cb.vertexColorRoughnessInfluence > 0.0) {
+    const float vertexColorLuma = dot(surfaceInteraction.vertexColor.rgb, vec3(0.299, 0.587, 0.114));
+    const float vertexColorSaturation = (max3(surfaceInteraction.vertexColor.r, surfaceInteraction.vertexColor.g, surfaceInteraction.vertexColor.b)
+      - min(surfaceInteraction.vertexColor.r, min(surfaceInteraction.vertexColor.g, surfaceInteraction.vertexColor.b)));
+    const float darknessAndTint = saturate((1.0 - vertexColorLuma) * 0.5 + vertexColorSaturation * 0.5);
+    roughness = saturate(roughness + darknessAndTint * float(cb.vertexColorRoughnessInfluence));
+  }
 
   // Load Metallic
 

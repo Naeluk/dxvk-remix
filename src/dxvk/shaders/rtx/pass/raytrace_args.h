@@ -415,6 +415,10 @@ struct RaytraceArgs {
   uint allowNrcTraining;
 
   float vertexColorStrength;
+  float vertexColorMinValue; // floor applied to raw vertex color when isVertexColorBakedLighting is false
+  float vertexColorTintAmount; // hue-reprojection blend amount for the non-baked-lighting path
+  float vertexColorRoughnessInfluence; // grime/moss roughness nudge from vertex color
+  float vertexColorHeightMaskStrength; // reduce vertex color mixing at bright (raised) height-map areas
   float alphaBlendSurfacePackMult; // for packing/unpacking hitT into Float16 in AlphaBlendSurface
 
   float wboitEnergyLossCompensation;

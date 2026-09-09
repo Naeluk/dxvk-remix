@@ -1348,6 +1348,10 @@ namespace dxvk {
 
     constants.uniformRandomNumber = jenkinsHash(constants.frameIdx);
     constants.vertexColorStrength = RtxOptions::vertexColorStrength();
+    constants.vertexColorMinValue = RtxOptions::vertexColorMinValue();
+    constants.vertexColorTintAmount = RtxOptions::vertexColorTintAmount();
+    constants.vertexColorRoughnessInfluence = RtxOptions::vertexColorRoughnessInfluence();
+    constants.vertexColorHeightMaskStrength = RtxOptions::vertexColorHeightMaskStrength();
     constants.viewModelRayTMax = RtxOptions::ViewModel::rangeMeters() * RtxOptions::getMeterToWorldUnitScale();
     constants.roughnessDemodulationOffset = m_common->metaDemodulate().demodulateRoughnessOffset();
     
