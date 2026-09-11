@@ -363,6 +363,10 @@ namespace dxvk {
                     "When Vertex Color Is Baked Lighting is off, blends albedo toward vertex color's hue while preserving the texture's own "
                     "brightness, instead of plain multiply-darkening. 0 = stock multiply behavior, 1 = full hue reprojection.",
                     args.minValue = 0.0f, args.maxValue = 1.0f);
+    RTX_OPTION_ARGS("rtx", float, vertexColorHueShiftAmount, 0.0f,
+                    "When Vertex Color Is Baked Lighting is off, rotates albedo's hue toward vertex color's hue while keeping the texture's "
+                    "own saturation and value (shading detail) intact. 0 = no hue shift, 1 = albedo hue fully matches vertex color's hue.",
+                    args.minValue = 0.0f, args.maxValue = 1.0f);
     RTX_OPTION_ARGS("rtx", float, vertexColorRoughnessInfluence, 0.0f,
                     "When Vertex Color Is Baked Lighting is off, roughens the surface based on how dark/saturated its vertex color is "
                     "(grime/moss heuristic). 0 = no effect on roughness.",
