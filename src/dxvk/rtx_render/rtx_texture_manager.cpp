@@ -1368,6 +1368,24 @@ namespace dxvk {
         uint32_t mipc = m_sf.m_accumulatedMipcount[tex->m_samplerFeedbackStamp].mipcount;
         mipc = std::min(mipc, allmipcount);
 
+        {
+          const VkExtent3D& extent = tex->m_assetData->info().extent;
+          const uint32_t minDim = std::min(extent.width, extent.height);
+          const uint32_t maxDim = std::max(extent.width, extent.height);
+
+          // MESURE THEM AND RETEST
+          uint32_t extraMips = 0;
+          if (minDim > 0) {
+            if (minDim <= 256)         extraMips = 3; // very small => prefer up to +2 mips
+            else if (minDim <= 512)    extraMips = 2; // small => prefer +1 mip
+          }
+          // If the texture is very narrow/tall (or wide/short), it's likely blurred along the long axis.
+          if (minDim > 0 && maxDim / minDim >= 4) {
+            extraMips = std::max(extraMips, 1u);
+          }
+
+          mipc = std::min(allmipcount, mipc + extraMips);
+        }
         // TODO: potential bottleneck
         size_t byteSize = calcSizeForAsset(*tex->m_assetData, allmipcount - mipc, allmipcount);
 
