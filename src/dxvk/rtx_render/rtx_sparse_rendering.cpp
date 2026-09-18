@@ -23,6 +23,8 @@
 
 #include "dxvk_device.h"
 #include "rtx_context.h"
+#include "rtx_scene_manager.h"
+#include "rtx_light_manager.h"
 #include "rtx_neural_radiance_cache.h"
 #include "rtx_ray_reconstruction.h"
 #include "rtx_options.h"
@@ -62,10 +64,6 @@ namespace dxvk {
         // Inputs
         TEXTURE2D(ACTIVE_PIXEL_MASK_BINDING_PIXEL_SAMPLING_RATE_INPUT)
 
-        // Input-Outputs
-        RW_TEXTURE2D(ACTIVE_PIXEL_MASK_BINDING_NRC_TRAINING_QUERY_KEY_RESERVOIR_INPUT_OUTPUT)
-        RW_TEXTURE2D(ACTIVE_PIXEL_MASK_BINDING_NRC_TRAINING_QUERY_PIXEL_INPUT_OUTPUT)
-
         // Outputs
         RW_TEXTURE2D(ACTIVE_PIXEL_MASK_BINDING_ACTIVE_PIXEL_MASK_OUTPUT)
       END_PARAMETER()
@@ -83,7 +81,7 @@ namespace dxvk {
         TEXTURE2D(ACTIVE_PIXEL_MASK_BINDING_SECONDARY_CONE_RADIUS_INPUT)
 
         // Input-Outputs
-        RW_TEXTURE2D(ACTIVE_PIXEL_MASK_BINDING_NRC_TRAINING_QUERY_KEY_RESERVOIR_INPUT_OUTPUT)
+        RW_TEXTURE2D(ACTIVE_PIXEL_MASK_BINDING_NRC_TRAINING_QUERY_RESERVOIR_INPUT_OUTPUT)
 
         // Outputs
         RW_TEXTURE2D(ACTIVE_PIXEL_MASK_BINDING_PIXEL_SAMPLING_RATE_OUTPUT)
@@ -286,11 +284,13 @@ namespace dxvk {
     ctx.bindResourceView(ACTIVE_PIXEL_MASK_BINDING_SECONDARY_CONE_RADIUS_INPUT, rtOutput.m_secondaryConeRadius.view(Resources::AccessType::Read), nullptr);
 
     // Input-Outputs
-    Rc<DxvkImageView> trainingQueryKeyReservoirView = nullptr;
+    // NRC training query-pixel reservoir, accumulated over active pixels. Only allocated while training-path
+    // resampling is on, which is also the only case the shader touches it.
+    Rc<DxvkImageView> trainingQueryReservoirView = nullptr;
     if (rtOutput.m_raytraceArgs.sparseRenderingArgs.resampledNrcTrainingPaths) {
-      trainingQueryKeyReservoirView = ctx.getCommonObjects()->metaNeuralRadianceCache().getTrainingQueryKeyReservoir().view;
+      trainingQueryReservoirView = ctx.getCommonObjects()->metaNeuralRadianceCache().getTrainingQueryReservoir().view;
     }
-    ctx.bindResourceView(ACTIVE_PIXEL_MASK_BINDING_NRC_TRAINING_QUERY_KEY_RESERVOIR_INPUT_OUTPUT, trainingQueryKeyReservoirView, nullptr);
+    ctx.bindResourceView(ACTIVE_PIXEL_MASK_BINDING_NRC_TRAINING_QUERY_RESERVOIR_INPUT_OUTPUT, trainingQueryReservoirView, nullptr);
 
     // Outputs
     ctx.bindResourceView(ACTIVE_PIXEL_MASK_BINDING_PIXEL_SAMPLING_RATE_OUTPUT, rtOutput.m_sparseRenderingPixelSamplingRate.view, nullptr);
@@ -309,17 +309,6 @@ namespace dxvk {
 
     // Inputs
     ctx.bindResourceView(ACTIVE_PIXEL_MASK_BINDING_PIXEL_SAMPLING_RATE_INPUT, rtOutput.m_sparseRenderingPixelSamplingRate.view, nullptr);
-
-    // Input-Outputs
-    Rc<DxvkImageView> trainingQueryKeyReservoirView = nullptr;
-    Rc<DxvkImageView> trainingQueryPixelView = nullptr;
-    if (rtOutput.m_raytraceArgs.sparseRenderingArgs.resampledNrcTrainingPaths) {
-      NeuralRadianceCache& nrc = ctx.getCommonObjects()->metaNeuralRadianceCache();
-      trainingQueryKeyReservoirView = nrc.getTrainingQueryKeyReservoir().view;
-      trainingQueryPixelView = nrc.getTrainingQueryPixel().view;
-    }
-    ctx.bindResourceView(ACTIVE_PIXEL_MASK_BINDING_NRC_TRAINING_QUERY_KEY_RESERVOIR_INPUT_OUTPUT, trainingQueryKeyReservoirView, nullptr);
-    ctx.bindResourceView(ACTIVE_PIXEL_MASK_BINDING_NRC_TRAINING_QUERY_PIXEL_INPUT_OUTPUT, trainingQueryPixelView, nullptr);
 
     // Outputs
     ctx.bindResourceView(ACTIVE_PIXEL_MASK_BINDING_ACTIVE_PIXEL_MASK_OUTPUT, rtOutput.m_sparseRenderingActivePixelMask.view, nullptr);
@@ -359,6 +348,7 @@ namespace dxvk {
     args.enableSparseVolumetricsPrimaryHit = Options::enableSparseVolumetricsPrimaryHit();
     args.enableSparseVolumetricsPrimaryMiss = Options::enableSparseVolumetricsPrimaryMiss();
     args.enableSparsePrimarySpecularAlbedo = Options::enableSparsePrimarySpecularAlbedo();
+    args.enableLightIdentityResolution = ctx.getSceneManager().getLightManager().isLightIdentityTableBuilt() ? 1u : 0u;
 
     NeuralRadianceCache& nrc = ctx.getCommonObjects()->metaNeuralRadianceCache();
     args.resampledNrcTrainingPaths = resamplesNrcTrainingPaths(nrc.isActive());
