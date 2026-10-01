@@ -1302,11 +1302,11 @@ namespace dxvk {
       RTX_OPTION("rtx.eye", bool, assumeViewTexgenModeAsEye, true,
                  "Used to detect eyes and its vectors, by assuming that a draw call with D3DTSS_TCI_CAMERASPACEPOSITION and specific texture transform is an eye draw call.");
       RTX_OPTION("rtx.eye", float, eyeballSphereOffset, 0.18F,
-                 "How much to offset a sphere origin when calculating the eye normals on Whites. "
+                 "Radius of the sphere used to calculate eye normals on the whites, in world units. "
                  "The larger the value, the more pronounced the ambient shadowing is on an eyeball, to better ground the eyes on a face.");
       RTX_OPTION("rtx.eye", float, corneaSphereOffset, 0.1F,
-                 "How much to offset a sphere origin when calculating the eye normals on Cornea. "
-                 "Positive values make the eye cornea appear more spherical. Negative values - more flat.");
+                 "Radius of the sphere used to calculate eye normals on the cornea, in world units. "
+                 "Larger values make the eye cornea appear more spherical.");
       RTX_OPTION("rtx.eye", float, eyeWhitesAlbedoScale, 0.5F, "Brightness multiplier for the eye whites.");
       RTX_OPTION("rtx.eye", float, irisRadius, 0.165F,
                  "Size of an iris in the iris texture. "
@@ -1334,6 +1334,9 @@ namespace dxvk {
       RTX_OPTION_FLAG_ENV("rtx.automation", bool, enableTestTrace, false, RtxOptionFlags::NoSave, "RTX_TEST_TRACE",
                           "Enables opt-in frame trace artifacts for automation-driven image tests.\n"
                           "When enabled, Remix records a bounded frame window around the configured screenshot frame, writes frame_trace.jsonl, and appends dxvk_trace_* summary fields to metrics.txt.");
+      RTX_OPTION_FLAG_ENV("rtx.automation", uint32_t, metricsWarmupFrames, 5, RtxOptionFlags::NoSave, "RTX_AUTOMATION_METRICS_WARMUP_FRAMES",
+                          "Number of frames, starting with the first ray traced frame, excluded as warmup from the averaged frame time, GPU idle time and memory usage in metrics.txt.\n"
+                          "Frames before the first ray traced frame are also excluded. 0 disables warmup, so every frame is averaged, including in runs that never ray trace. dxvk_warmup_time_ms reports the dxvk_total_time_ms clock at the last warmup sample.");
     };
 
   public:

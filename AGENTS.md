@@ -40,7 +40,9 @@ Full guide: `documentation/CONTRIBUTING-style-guide.md`
   - Constants: `k` prefix and camelCase, i.e. `kConstantName`
   - Macros and defines: `UPPER_CASE`
   - Classes and structs: `PascalCase`
-- **Conditions**: Test an integer flag by referencing the variable on its own, `if (flag)`, not `if (flag != 0)`. Applies to C++ and Slang, including `uint` flags in constant buffers. Bit tests like `(flags & kSomeBit) != 0` are unaffected.
+- **Conditions**: 
+  - Test an integer flag by referencing the variable on its own, `if (flag)`, not `if (flag != 0)`. Applies to C++ and Slang, including `uint` flags in constant buffers. Bit tests like `(flags & kSomeBit) != 0` are unaffected.
+  - Put subjects first. Good: `if (pData == nullptr)`, Bad: `if (nullptr == pData)`.
 - **Includes**: Standard library first, then third-party, then local. Separate groups with blank lines.
 - **Memory**: Prefer smart pointers (`std::unique_ptr`, `std::shared_ptr`). Use `Rc<T>` for GPU resources.
 - **Profiling**: Use `ScopedCpuProfileZone()` / `ScopedGpuProfileZone(ctx, "name")` for performance-critical code.
@@ -69,6 +71,11 @@ Wrap diverging code in comment blocks:
 - New `.cpp` and `.h` files must be added to the `dxvk_src` list in `src/dxvk/meson.build` (alphabetically, both `.cpp` and `.h` on adjacent lines).
 - New shader files (`.comp.slang`, `.rgen.slang`, etc.) are auto-discovered from `src/dxvk/shaders/rtx/` — no build system registration needed.
 
+### Adding New Exports
+
+- Always use REMIXAPI macro for Remix exported functions, do NOT use DLLEXPORT macro.
+- Always use REMIXAPI_CALL macro for calling convention for exported function.
+- Always add new export function shims to d3d9_rtx_shim.cpp for correct shimming on WoA.
 
 ## RTX Options
 

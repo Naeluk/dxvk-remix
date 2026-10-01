@@ -142,10 +142,7 @@ namespace dxvk {
         RW_TEXTURE2D(GBUFFER_BINDING_REFLECTION_PSR_DATA_STORAGE_1)
 
         RW_TEXTURE2D(GBUFFER_BINDING_REFLECTION_PSR_DATA_STORAGE_2)
-        RW_TEXTURE2D(GBUFFER_BINDING_TRANSMISSION_PSR_DATA_STORAGE_0)
-        RW_TEXTURE2D(GBUFFER_BINDING_TRANSMISSION_PSR_DATA_STORAGE_1)
-        RW_TEXTURE2D(GBUFFER_BINDING_TRANSMISSION_PSR_DATA_STORAGE_2)
-        RW_TEXTURE2D(GBUFFER_BINDING_TRANSMISSION_PSR_DATA_STORAGE_3)
+        RW_STRUCTURED_BUFFER(GBUFFER_BINDING_TRANSMISSION_PSR_DATA_STORAGE)
 
         RW_TEXTURE2D(GBUFFER_BINDING_PRIMARY_DEPTH_DLSSRR_OUTPUT)
         RW_TEXTURE2D(GBUFFER_BINDING_PRIMARY_NORMAL_DLSSRR_OUTPUT)
@@ -670,7 +667,10 @@ namespace dxvk {
     ctx->bindResourceView(GBUFFER_BINDING_PRIMARY_VIRTUAL_MVEC_OUTPUT, rtOutput.m_primaryVirtualMotionVector.view(Resources::AccessType::Write), nullptr);
     ctx->bindResourceView(GBUFFER_BINDING_PRIMARY_SCREEN_SPACE_MOTION_OUTPUT, rtOutput.m_primaryScreenSpaceMotionVector.view, nullptr);
     ctx->bindResourceView(GBUFFER_BINDING_PRIMARY_VIRTUAL_WORLD_SHADING_NORMAL_OUTPUT, rtOutput.m_primaryVirtualWorldShadingNormalPerceptualRoughness.view, nullptr);
-    ctx->bindResourceView(GBUFFER_BINDING_PRIMARY_VIRTUAL_WORLD_SHADING_NORMAL_DENOISING_OUTPUT, rtOutput.m_primaryVirtualWorldShadingNormalPerceptualRoughnessDenoising.view(Resources::AccessType::Write), nullptr);
+    ctx->bindResourceView(GBUFFER_BINDING_PRIMARY_VIRTUAL_WORLD_SHADING_NORMAL_DENOISING_OUTPUT,
+      rtOutput.m_primaryVirtualWorldShadingNormalPerceptualRoughnessDenoising.empty()
+        ? nullptr
+        : rtOutput.m_primaryVirtualWorldShadingNormalPerceptualRoughnessDenoising.view(Resources::AccessType::Write), nullptr);
     ctx->bindResourceView(GBUFFER_BINDING_PRIMARY_HIT_DISTANCE_OUTPUT, rtOutput.m_primaryHitDistance.view, nullptr);
     ctx->bindResourceView(GBUFFER_BINDING_PRIMARY_VIEW_DIRECTION_OUTPUT, rtOutput.m_primaryViewDirection.view, nullptr);
     ctx->bindResourceView(GBUFFER_BINDING_PRIMARY_CONE_RADIUS_OUTPUT, rtOutput.m_primaryConeRadius.view, nullptr);
@@ -702,12 +702,10 @@ namespace dxvk {
 
     ctx->bindResourceView(GBUFFER_BINDING_REFLECTION_PSR_DATA_STORAGE_1, rtOutput.m_gbufferPSRData[1].view(Resources::AccessType::Write), nullptr);
 
-    // Note: m_gbufferPSRData[2..6] are aliased with various radiance textures that are used later as integrator outputs.
+    // Note: m_gbufferPSRData[1..2] are aliased with radiance textures that are used later as integrator outputs.
     ctx->bindResourceView(GBUFFER_BINDING_REFLECTION_PSR_DATA_STORAGE_2, rtOutput.m_gbufferPSRData[2].view(Resources::AccessType::Write), nullptr);
-    ctx->bindResourceView(GBUFFER_BINDING_TRANSMISSION_PSR_DATA_STORAGE_0, rtOutput.m_gbufferPSRData[3].view(Resources::AccessType::Write), nullptr);
-    ctx->bindResourceView(GBUFFER_BINDING_TRANSMISSION_PSR_DATA_STORAGE_1, rtOutput.m_gbufferPSRData[4].view(Resources::AccessType::Write), nullptr);
-    ctx->bindResourceView(GBUFFER_BINDING_TRANSMISSION_PSR_DATA_STORAGE_2, rtOutput.m_gbufferPSRData[5].view(Resources::AccessType::Write), nullptr);
-    ctx->bindResourceView(GBUFFER_BINDING_TRANSMISSION_PSR_DATA_STORAGE_3, rtOutput.m_gbufferPSRData[6].view(Resources::AccessType::Write), nullptr);
+    // The RTXDI reservoir buffer's scratch page, which is idle until RTXDI initial sampling.
+    ctx->bindResourceBuffer(GBUFFER_BINDING_TRANSMISSION_PSR_DATA_STORAGE, rtOutput.m_transmissionPSRData.slice(Resources::AccessType::Write));
 
     // Bind necessary buffers for DLSS-RR. 
     // Note: RR uses different PSR rules compared to other uses, and its resolves are resolved in an another shader.
@@ -759,6 +757,26 @@ namespace dxvk {
       rtOutput.m_raytraceArgs.enableRaytracedRenderTarget,
       rtOutput.m_raytraceArgs.enableStochasticAlphaBlend);
     const VkExtent3D workgroups = util::computeBlockCount(rayDims, VkExtent3D { 16, 8, 1 });
+    const RaytraceMode raytraceMode = RtxOptions::renderPassGBufferRaytraceMode();
+
+    // Binds the Primary Rays or PSR pass of the raytrace mode.
+    auto bindPass = [&](const bool isPSRPass) {
+      if (raytraceMode == RaytraceMode::RayQuery) {
+        ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, getComputeShader(rayQueryFeatureVariant, isPSRPass, nrcEnabled, wboitEnabled));
+      } else {
+        ctx->bindRaytracingPipelineShaders(getPipelineShaders(
+          pipelineFeatureVariant, isPSRPass, raytraceMode == RaytraceMode::RayQueryRayGen,
+          serEnabled, ommEnabled, includePortals, nrcEnabled, wboitEnabled));
+      }
+    };
+
+    auto dispatchPass = [&]() {
+      if (raytraceMode == RaytraceMode::RayQuery) {
+        ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
+      } else {
+        ctx->traceRays(rayDims.width, rayDims.height, rayDims.depth);
+      }
+    };
 
     GbufferPushConstants pushArgs = {};
     pushArgs.isTransmissionPSR = 0;
@@ -799,93 +817,35 @@ namespace dxvk {
       ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
     };
 
-    switch (RtxOptions::renderPassGBufferRaytraceMode()) {
-    case RaytraceMode::RayQuery:
-      {
-        ScopedGpuProfileZone(ctx, "Primary Rays");
-        ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, getComputeShader(rayQueryFeatureVariant, false, nrcEnabled, wboitEnabled));
-        ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
-      }
+    if (raytraceMode >= RaytraceMode::Count) {
+      assert(false && "Invalid RaytraceMode in DxvkPathtracerGbuffer::dispatch");
+      return;
+    }
 
-      dispatchDeferredDecals();
-      dispatchPSRPrepare();
+    {
+      ScopedGpuProfileZone(ctx, "Primary Rays");
+      bindPass(false);
+      dispatchPass();
+    }
 
-      {
-        // Warning: do not change the order of Reflection and Transmission PSR, that will break
-        // PSR data dependencies due to resource aliasing.
-        ScopedGpuProfileZone(ctx, "Reflection PSR");
-        ctx->setFramePassStage(RtxFramePassStage::ReflectionPSR);
-        ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, getComputeShader(rayQueryFeatureVariant, true, nrcEnabled, wboitEnabled));
-        ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
-      }
+    dispatchDeferredDecals();
+    dispatchPSRPrepare();
 
-      {
-        ScopedGpuProfileZone(ctx, "Transmission PSR");
-        ctx->setFramePassStage(RtxFramePassStage::TransmissionPSR);
-        pushArgs.isTransmissionPSR = 1;
-        ctx->pushConstants(0, sizeof(pushArgs), &pushArgs);
-        ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
-      }
-      break;
+    {
+      // Warning: do not change the order of Reflection and Transmission PSR, that will break
+      // PSR data dependencies due to resource aliasing.
+      ScopedGpuProfileZone(ctx, "Reflection PSR");
+      ctx->setFramePassStage(RtxFramePassStage::ReflectionPSR);
+      bindPass(true);
+      dispatchPass();
+    }
 
-      case RaytraceMode::RayQueryRayGen:
-      {
-        ScopedGpuProfileZone(ctx, "Primary Rays");
-        ctx->bindRaytracingPipelineShaders(getPipelineShaders(pipelineFeatureVariant, false, true, serEnabled, ommEnabled, includePortals, nrcEnabled, wboitEnabled));
-        ctx->traceRays(rayDims.width, rayDims.height, rayDims.depth);
-      }
-
-      dispatchDeferredDecals();
-      dispatchPSRPrepare();
-
-      {
-        // Warning: do not change the order of Reflection and Transmission PSR, that will break
-        // PSR data dependencies due to resource aliasing.
-        ScopedGpuProfileZone(ctx, "Reflection PSR");
-        ctx->setFramePassStage(RtxFramePassStage::ReflectionPSR);
-        ctx->bindRaytracingPipelineShaders(getPipelineShaders(pipelineFeatureVariant, true, true, serEnabled, ommEnabled, includePortals, nrcEnabled, wboitEnabled));
-        ctx->traceRays(rayDims.width, rayDims.height, rayDims.depth);
-      }
-
-      {
-        ScopedGpuProfileZone(ctx, "Transmission PSR");
-        ctx->setFramePassStage(RtxFramePassStage::TransmissionPSR);
-        pushArgs.isTransmissionPSR = 1;
-        ctx->pushConstants(0, sizeof(pushArgs), &pushArgs);
-        ctx->traceRays(rayDims.width, rayDims.height, rayDims.depth);
-      }
-      break;
-
-      case RaytraceMode::TraceRay:
-      {
-        ScopedGpuProfileZone(ctx, "Primary Rays");
-        ctx->bindRaytracingPipelineShaders(getPipelineShaders(pipelineFeatureVariant, false, false, serEnabled, ommEnabled, includePortals, nrcEnabled, wboitEnabled));
-        ctx->traceRays(rayDims.width, rayDims.height, rayDims.depth);
-      }
-
-      dispatchDeferredDecals();
-      dispatchPSRPrepare();
-
-      {
-        // Warning: do not change the order of Reflection and Transmission PSR, that will break
-        // PSR data dependencies due to resource aliasing.
-        ScopedGpuProfileZone(ctx, "Reflection PSR");
-        ctx->setFramePassStage(RtxFramePassStage::ReflectionPSR);
-        ctx->bindRaytracingPipelineShaders(getPipelineShaders(pipelineFeatureVariant, true, false, serEnabled, ommEnabled, includePortals, nrcEnabled, wboitEnabled));
-        ctx->traceRays(rayDims.width, rayDims.height, rayDims.depth);
-      }
-
-      {
-        ScopedGpuProfileZone(ctx, "Transmission PSR");
-        ctx->setFramePassStage(RtxFramePassStage::TransmissionPSR);
-        pushArgs.isTransmissionPSR = 1;
-        ctx->pushConstants(0, sizeof(pushArgs), &pushArgs);
-        ctx->traceRays(rayDims.width, rayDims.height, rayDims.depth);
-      }
-      break;
-      case RaytraceMode::Count:
-        assert(false && "Invalid RaytraceMode in DxvkPathtracerGbuffer::dispatch");
-      break;
+    {
+      ScopedGpuProfileZone(ctx, "Transmission PSR");
+      ctx->setFramePassStage(RtxFramePassStage::TransmissionPSR);
+      pushArgs.isTransmissionPSR = 1;
+      ctx->pushConstants(0, sizeof(pushArgs), &pushArgs);
+      dispatchPass();
     }
   }
 

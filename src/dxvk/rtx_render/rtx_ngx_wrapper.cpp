@@ -47,11 +47,8 @@
 #include <nvsdk_ngx_helpers_dlssg_vk.h>
 #include <nvsdk_ngx_defs_dlssg.h>
 
-// DLSS-NR (ngx_sdk_dlnr) has no arm64 package yet, so it is unavailable on WoA builds.
-#ifdef _M_X64
 #include <nvsdk_ngx_defs_dlssnr.h>
 #include <nvsdk_ngx_helpers_dlssnr_vk.h>
-#endif
 
 #include "rtx_resources.h"
 #include "rtx_semaphore.h"
@@ -70,9 +67,7 @@ namespace {
 namespace dxvk
 {
   namespace {
-#ifdef _M_X64
     constexpr float kDlssNrGlobalToneStrength = 1.0f;
-#endif
 
     std::string resultToString(NVSDK_NGX_Result result) {
       char buf[1024];
@@ -385,7 +380,6 @@ namespace dxvk
   }
 
   bool NGXContext::checkDlssNeuralRenderingSupport(NVSDK_NGX_Parameter* params) {
-#ifdef _M_X64
     int needsUpdatedDriver = 0;
     NVSDK_NGX_Result result = params->Get(NVSDK_NGX_Parameter_DLSSNR_NeedsUpdatedDriver, &needsUpdatedDriver);
     if (NVSDK_NGX_FAILED(result)) {
@@ -421,10 +415,6 @@ namespace dxvk
     }
 
     return true;
-#else
-    // DLSS-NR (ngx_sdk_dlnr) has no arm64 package yet.
-    return false;
-#endif
   }
 
   static bool checkHardwareSchedulingEnabled(DxvkDevice* device) {
@@ -735,16 +725,6 @@ namespace dxvk
     createFlags |= autoExposure ? NVSDK_NGX_DLSS_Feature_Flags_AutoExposure : 0;
     createFlags |= sharpening ? NVSDK_NGX_DLSS_Feature_Flags_DoSharpening : 0;
 
-    NVSDK_NGX_DLSS_Create_Params createParams = {};
-
-    createParams.Feature.InWidth = maxRenderSize[0];
-    createParams.Feature.InHeight = maxRenderSize[1];
-    createParams.Feature.InTargetWidth = displayOutSize[0];
-    createParams.Feature.InTargetHeight = displayOutSize[1];
-    createParams.Feature.InPerfQualityValue = perfQuality;
-    createParams.InFeatureCreateFlags = createFlags;
-    createParams.InFeatureCreateFlags &= ~NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
-
     VkCommandBuffer vkCommandBuffer = renderContext->getCommandList()->getCmdBuffer(dxvk::DxvkCmdBuffer::ExecBuffer);
 
     NVSDK_NGX_DLSSD_Create_Params dlssdCreateParams = {};
@@ -834,32 +814,10 @@ namespace dxvk
     NVSDK_NGX_Resource_VK resolvedColorResource = TextureToResourceVK(buffers.pResolvedColor, true);
     NVSDK_NGX_Resource_VK motionVectorsResource = TextureToResourceVK(buffers.pMotionVectors, false);
     NVSDK_NGX_Resource_VK depthResource = TextureToResourceVK(buffers.pDepth, false);
-    NVSDK_NGX_Resource_VK exposureResource = TextureToResourceVK(buffers.pExposure, false);
-    NVSDK_NGX_Resource_VK biasCurrentColorMaskResource = TextureToResourceVK(buffers.pBiasCurrentColorMask, false);
     NVSDK_NGX_Resource_VK hitDistanceResource = TextureToResourceVK(buffers.pHitDistance, false);
 
-    NVSDK_NGX_VK_DLSS_Eval_Params evalParams = {};
-    evalParams.Feature.pInColor = &unresolvedColorResource;
-    evalParams.Feature.pInOutput = &resolvedColorResource;
-    evalParams.pInDepth = &depthResource;
-    // xxxnsubtil: the DLSS indicator reads the exposure texture even when DLSS autoexposure is on
-    evalParams.pInExposureTexture = &exposureResource;
-    evalParams.pInMotionVectors = &motionVectorsResource;
-    evalParams.pInBiasCurrentColorMask = settings.antiGhost ? &biasCurrentColorMaskResource : nullptr;
-    evalParams.InJitterOffsetX = settings.jitterOffset[0];
-    evalParams.InJitterOffsetY = settings.jitterOffset[1];
-    // Note: Sharpness parameter is deprecated and is not read by newer versions of DLSS, so setting it to 0 is fine here.
-    evalParams.Feature.InSharpness = 0.0f;
-    evalParams.InPreExposure = settings.preExposure;
-    evalParams.InReset = settings.resetAccumulation ? 1 : 0;
-    evalParams.InMVScaleX = settings.motionVectorScale[0];
-    evalParams.InMVScaleY = settings.motionVectorScale[1];
-    evalParams.InRenderSubrectDimensions = { inWidth, inHeight };
-
-    NVSDK_NGX_Result result;
     NVSDK_NGX_Resource_VK diffuseAlbedoResource = TextureToResourceVK(buffers.pDiffuseAlbedo, false);
     NVSDK_NGX_Resource_VK specularAlbedoResource = TextureToResourceVK(buffers.pSpecularAlbedo, false);
-    NVSDK_NGX_Resource_VK positionResource = TextureToResourceVK(buffers.pPosition, false);
     NVSDK_NGX_Resource_VK normalsResource = TextureToResourceVK(buffers.pNormals, false);
     NVSDK_NGX_Resource_VK roughnessResource = TextureToResourceVK(buffers.pRoughness, false);
     NVSDK_NGX_Resource_VK disocclusionMask = TextureToResourceVK(buffers.pDisocclusionMask, false);
@@ -889,7 +847,7 @@ namespace dxvk
     evalParams_DLDN.pInSpecularHitDistance = buffers.pHitDistance ? &hitDistanceResource : nullptr;
     evalParams_DLDN.pInDisocclusionMask = &disocclusionMask;
 
-    result = NGX_VULKAN_EVALUATE_DLSSD_EXT(vkCommandbuffer, m_featureRayReconstruction, m_parameters, &evalParams_DLDN);
+    NVSDK_NGX_Result result = NGX_VULKAN_EVALUATE_DLSSD_EXT(vkCommandbuffer, m_featureRayReconstruction, m_parameters, &evalParams_DLDN);
 
     if (NVSDK_NGX_FAILED(result)) {
       success = false;
@@ -1073,11 +1031,6 @@ namespace dxvk
   }
 
   void NGXNeuralRenderingContext::initialize(Rc<DxvkContext> renderContext, const uint32_t displaySize[2]) {
-#ifndef _M_X64
-    // DLSS-NR (ngx_sdk_dlnr) has no arm64 package yet; NGXContext::checkDlssNeuralRenderingSupport
-    // always reports unsupported on this platform, so this context should never be constructed.
-    m_initialized = false;
-#else
     if (m_neuralRenderingFeature) {
       renderContext->getDevice()->waitForIdle();
       releaseNGXFeature();
@@ -1099,7 +1052,6 @@ namespace dxvk
     }
 
     m_initialized = true;
-#endif
   }
 
   bool NGXNeuralRenderingContext::evaluateNeuralRendering(
@@ -1107,11 +1059,6 @@ namespace dxvk
     if (!isNeuralRenderingInitialized()) {
       return false;
     }
-
-#ifndef _M_X64
-    // DLSS-NR (ngx_sdk_dlnr) has no arm64 package yet; unreachable since isNeuralRenderingInitialized() is always false.
-    return false;
-#else
     ScopedCpuProfileZone();
 
     const uint32_t width = buffers.pInColor->image->info().extent.width;
@@ -1172,7 +1119,6 @@ namespace dxvk
     }
 
     return true;
-#endif
   }
 
   void NGXNeuralRenderingContext::releaseNGXFeature() {

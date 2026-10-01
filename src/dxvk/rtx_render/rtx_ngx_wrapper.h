@@ -28,14 +28,13 @@
 #include <nvsdk_ngx_defs.h>
 #include <nvsdk_ngx_defs_dlssd.h>
 #include <nvsdk_ngx_defs_dlssg.h>
-#ifdef _M_X64
 #include <nvsdk_ngx_defs_dlssnr.h>
-#endif
 #endif
 
 #include <cstdint>
 #include <memory>
 #include "../util/rc/util_rc_ptr.h"
+#include "../util/util_export_macros.h"
 #include "rtx_semaphore.h"
 
 // run DLFG in graphics queue for debugging
@@ -258,22 +257,17 @@ namespace dxvk {
       const Resources::Resource* pDepth;
       const Resources::Resource* pDiffuseAlbedo;
       const Resources::Resource* pSpecularAlbedo;
-      const Resources::Resource* pExposure;
-      const Resources::Resource* pPosition;
       const Resources::Resource* pNormals;
       const Resources::Resource* pRoughness;
-      const Resources::Resource* pBiasCurrentColorMask;
       const Resources::Resource* pHitDistance;
       const Resources::Resource* pDisocclusionMask;
     };
 
     struct NGXSettings {
       bool resetAccumulation;
-      bool antiGhost;
       float preExposure;
       float jitterOffset[2];
       float motionVectorScale[2];
-      bool autoExposure;
       float frameTimeMilliseconds;
     };
 
@@ -430,4 +424,4 @@ namespace dxvk {
 }
 
 // -1 while NGX support is unknown, 0 when unavailable, and 1 when available.
-extern "C" __declspec(dllexport) int remixinternal_GetDlssNeuralRenderingStatus();
+extern "C" REMIXAPI int remixinternal_GetDlssNeuralRenderingStatus();
