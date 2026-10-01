@@ -2056,7 +2056,8 @@ namespace dxvk {
     ScopedCpuProfileZone();
     // Attempt to convert the D3D9 light to RT
 
-    std::optional<LightData> lightData = LightData::tryCreate(light);
+    const Vector3& fogNative = getFogState().color;
+    std::optional<LightData> lightData = LightData::tryCreate(light, &fogNative);
 
     // Note: Skip adding this light if it is somehow malformed such that it could not be created.
     if (!lightData.has_value()) {
