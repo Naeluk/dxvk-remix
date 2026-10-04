@@ -316,9 +316,9 @@ namespace dxvk {
     ctx->bindResourceView(COMPOSITE_SHARED_FLAGS_INPUT, rtOutput.m_sharedFlags.view, nullptr);
     ctx->bindResourceView(COMPOSITE_SHARED_RADIANCE_RG_INPUT, rtOutput.m_sharedRadianceRG.view, nullptr);
     ctx->bindResourceView(COMPOSITE_SHARED_RADIANCE_B_INPUT, rtOutput.m_sharedRadianceB.view, nullptr);
-    
+
     ctx->bindResourceView(COMPOSITE_PRIMARY_ATTENUATION_INPUT, rtOutput.m_primaryAttenuation.view, nullptr);
-    
+
     // Note: Texture contains Base Reflectivity here (due to being before the demodulate pass)
 
     ctx->bindResourceView(COMPOSITE_PRIMARY_SPECULAR_ALBEDO_INPUT, rtOutput.m_primarySpecularAlbedo.view(Resources::AccessType::Read), nullptr);
@@ -384,7 +384,7 @@ namespace dxvk {
     if (domeLightArgs.active && domeLightArgs.textureIndex != BINDING_INDEX_INVALID) {
       RtxTextureManager& texManager = ctx->getCommonObjects()->getTextureManager();
       const TextureRef& domeLightTex = texManager.getTextureTable()[domeLightArgs.textureIndex];
-      
+
       ctx->bindResourceView(COMPOSITE_SKY_LIGHT_TEXTURE, domeLightTex.getImageView(), nullptr);
     } else {
       ctx->bindResourceView(COMPOSITE_SKY_LIGHT_TEXTURE, ctx->getResourceManager().getSkyMatte(ctx).view, nullptr);
@@ -393,11 +393,20 @@ namespace dxvk {
     compositeArgs.camera = sceneManager.getCamera().getShaderConstants();
     compositeArgs.frameIdx = frameIdx;
 
+    float skyBrightnessFromFogAverage = RtxOptions::skyBrightness();
+
     if (enableFog()) {
-      const float colorScale = fogColorScale();
-      auto& fog = settings.fog;
+      vec3 fogNative = sceneManager.getFogState().color;
+      const float avgFogColor = (fogNative.x + fogNative.y + fogNative.z) / 3.0f;
+
+      const auto& fog = settings.fog;
+
+      skyBrightnessFromFogAverage = avgFogColor;
       compositeArgs.fogMode = fog.mode;
-      compositeArgs.fogColor = { fog.color.x * colorScale, fog.color.y * colorScale, fog.color.z * colorScale };
+      const float colorScale = fogColorScale();
+      const auto& fogNativeVK = sRGBGammaToLinear(dxvk::Vector3(fogNative.x, fogNative.y, fogNative.z));
+      fogNative = vec3(fogNativeVK.x, fogNativeVK.y, fogNativeVK.z);
+      compositeArgs.fogColor = { fogNative.x * colorScale, fogNative.y * colorScale , fogNative.z * colorScale };
       // Todo: Scene scale stuff ignored for now because scene scale stuff is not actually functioning properly. Add back in if it's ever fixed.
       // compositeArgs.fogEnd = fog.end * RtxOptions::sceneScale();
       // compositeArgs.fogScale = fog.scale * RtxOptions::sceneScale();
@@ -473,24 +482,25 @@ namespace dxvk {
     compositeArgs.stochasticAlphaBlendDiscardBlackPixel = stochasticAlphaBlendDiscardBlackPixel();
     compositeArgs.stochasticAlphaBlendRadianceVolumeMultiplier = stochasticAlphaBlendRadianceVolumeMultiplier();
     compositeArgs.alphaBlendSurfacePackMult = RtxOptions::getMeterToWorldUnitScale();
-    
+
     compositeArgs.clearColorFinalColor = sceneManager.getGlobals().clearColorFinalColor;
 
     // TODO: These are copied from raytrace_args.  Perhaps we should unify this...
-    
+
     // We are going to use this value to perform some animations on GPU, to mitigate precision related issues loop time
     // at the 24 bit boundary (as we use a 8 bit scalar on top of this time which we want to fit into 32 bits without issues,
     // plus we also convert this value to a floating point value at some point as well which has 23 bits of precision).
     // Bitwise and used rather than modulus as well for slightly better performance.
     compositeArgs.timeSinceStartMS = static_cast<uint32_t>(GlobalTime::get().absoluteTimeMs()) & ((1U << 24U) - 1U);
-    
+
     RayPortalManager::SceneData portalData = sceneManager.getRayPortalManager().getRayPortalInfoSceneData();
     compositeArgs.numActiveRayPortals = portalData.numActiveRayPortals;
     memcpy(&compositeArgs.rayPortalHitInfos[0], &portalData.rayPortalHitInfos, sizeof(portalData.rayPortalHitInfos));
     memcpy(&compositeArgs.rayPortalHitInfos[maxRayPortalCount], &portalData.previousRayPortalHitInfos, sizeof(portalData.previousRayPortalHitInfos));
 
     compositeArgs.domeLightArgs = domeLightArgs;
-    compositeArgs.skyBrightness = RtxOptions::skyBrightness();
+    const float skyBrightnessMlt = RtxOptions::skyBrightness();
+    compositeArgs.skyBrightness = skyBrightnessFromFogAverage * skyBrightnessMlt;
 
     const bool sparseRenderingEnabled = rtOutput.m_raytraceArgs.sparseRenderingArgs.mode != SparseRenderingMode::Off;
 

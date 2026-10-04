@@ -539,8 +539,37 @@ void applyVolumetricLighting(
       }
       alphaBlendOutput = totalLight.xyz;
 
+
+      const CameraDirections primaryRayDirections =
+      cameraPixelCoordinateToDirection(cb.camera, pixelCoordinate);
+
+      const float primaryLinearViewZ = PrimaryLinearViewZ[pixelCoordinate];
+
+      const vec3 viewPosition =
+          cameraReconstructViewPosition(
+        cb.camera,
+        primaryRayDirections.viewDirection,
+        primaryLinearViewZ);
+
+      const float viewDistance = length(viewPosition);
+
+      // Convert the reconstructed view-space position into world space.
+      const vec3 worldPosition =
+  mul(cb.camera.viewToWorld, vec4(viewPosition, 1.0f)).xyz;
+
+      const float worldY = worldPosition.z;
+
+      float horizonMask = createHorizonDepthMask(primaryLinearViewZ, 9000.0);
+  const float horizonY = horizonMask;
+
       if (cb.volumeArgs.enable)
       {
+
+          // non volume?:
+          const vec4 fogColor = calculateFog(surface.hitT, worldY, worldPosition, primaryRayDirections, pixelCoordinate, primaryMiss);
+          alphaBlendOutput = alphaBlendOutput * (1.0f - fogColor.a) + fogColor.rgb * fogColor.a;
+          alphaBlendOutput *= (1 - backgroundAlpha);
+
         float alphaBlendSurfaceLinearViewZ = surface.hitT * primaryRayDirections.viewDirection.z;
 
         vec2 volumeUV = cameraPixelCoordinateToScreenUV(cb.camera, pixelCoordinate);
@@ -558,7 +587,7 @@ void applyVolumetricLighting(
       }
       else
       {
-        const vec4 fogColor = calculateFog(surface.hitT);
+          const vec4 fogColor = calculateFog(surface.hitT, worldY, worldPosition, primaryRayDirections, pixelCoordinate, primaryMiss);
         alphaBlendOutput = alphaBlendOutput * (1.0f - fogColor.a) + fogColor.rgb * fogColor.a;
         alphaBlendOutput *= (1 - backgroundAlpha);
       }
@@ -613,22 +642,27 @@ void applySkyContribution(
     skyContribution *= radianceScale;
   }
 
+
   radianceOutput += skyContribution;
 }
 
 float applyFog(
   float viewDistance,
   float radianceScale,
-  inout vec3 radianceOutput)
+  inout vec3 radianceOutput, 
+  bool primaryMiss,
+  float worldY,
+  vec3 worldPosition,
+  CameraDirections primaryRayDirections,
+  uint2 pixelCoordinate)
 {
-  if (cb.volumeArgs.enable)
-  {
-    return 1.0f; // Volumetric fog is applied in volume integration
-  }
 
-  // Todo: Using view distance is a bit of a hack here, the primary emissive contribution will not be fully weighted correctly
-  // as emissive hits will be over-attenuated.
-  vec4 fogColor = calculateFog(viewDistance);
+
+    // Todo: Using view distance is a bit of a hack here, the primary emissive contribution will not be fully weighted correctly
+    //  as emissive hits will be over-attenuated.
+  
+    vec4 fogColor = calculateFog(viewDistance, worldY, worldPosition, primaryRayDirections, pixelCoordinate, primaryMiss);
+
 
   if (cb.sparseRenderingArgs.mode != SparseRenderingMode::Off)
   {
@@ -640,6 +674,18 @@ float applyFog(
 
   return 1.0f - fogColor.a;
 }
+
+E
+float createHorizonDepthMask(float linearViewZ, float maxDistance)
+{
+    // Normalize based on max distance
+    float normalizedDepth = saturate(linearViewZ / maxDistance);
+
+    // Dense at horizon (small depth), fades toward sky (large depth)
+    float mask = pow(1.0 - normalizedDepth, 2.0);
+
+    // Smooth transition
+    return smoothstep(0.0, 1.0, mask);
 
 // Sparse rendering scale for sky and fog in-scatter: 1 / rate at active sparse misses, 0 at inactive ones, otherwise 1.
 float calculateRadianceScale(uint2 pixelCoordinate, bool pixelIsActive, bool primaryMiss)
@@ -673,6 +719,7 @@ float calculateVolumetricRadianceScale(uint2 pixelCoordinate, bool pixelIsActive
   }
 
   return calculateRadianceScaleFromSamplingRate(SparseRenderingPixelSamplingRate[pixelCoordinate]);
+
 }
 
 vec4 compositeResult(
@@ -761,8 +808,18 @@ vec4 compositeResult(
   // Add sky radiance
   applySkyContribution(pixelCoordinate, primaryRayDirections, primaryMiss, radianceScale, volumeAttenuation, radianceOutput);
 
+  const float primaryLinearViewZ = PrimaryLinearViewZ[pixelCoordinate];
+
+  const vec3 worldPosition =
+  mul(cb.camera.viewToWorld, vec4(viewPosition, 1.0f)).xyz;
+
+  const float worldY = worldPosition.z;
+
+  float horizonMask = createHorizonDepthMask(primaryLinearViewZ, 9000.0);
+  const float horizonY = horizonMask;
+
   // Apply fog
-  const float fogTransmittance = applyFog(viewDistance, radianceScale, radianceOutput);
+  const float fogTransmittance = applyFog(viewDistance, radianceScale, radianceOutput, primaryMiss, worldY, worldPosition, primaryRayDirections, pixelCoordinate);
   controlMaskTransmittance = calcBt709Luminance(saturate(controlMaskVolumeAttenuation));
   controlMaskTransmittance *= fogTransmittance * backgroundAlpha;
 
