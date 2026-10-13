@@ -40,12 +40,20 @@ Full guide: `documentation/CONTRIBUTING-style-guide.md`
   - Constants: `k` prefix and camelCase, i.e. `kConstantName`
   - Macros and defines: `UPPER_CASE`
   - Classes and structs: `PascalCase`
-- **Conditions**: Test an integer flag by referencing the variable on its own, `if (flag)`, not `if (flag != 0)`. Applies to C++ and Slang, including `uint` flags in constant buffers. Bit tests like `(flags & kSomeBit) != 0` are unaffected.
-- **Includes**: Standard library first, then third-party, then local. Separate groups with blank lines.
+- **Conditions**: 
+  - Test an integer flag by referencing the variable on its own, `if (flag)`, not `if (flag != 0)`. Applies to C++ and Slang, including `uint` flags in constant buffers. Bit tests like `(flags & kSomeBit) != 0` are unaffected.
+  - Put subjects first. Good: `if (pData == nullptr)`, Bad: `if (nullptr == pData)`.
+  - Break long or complex ternaries after the condition, with `? A` and `: B` on the two following lines, each indented one level. Keep short ones on one line.
+- **Includes**: Place them at the start of the file, after the copyright header, never partway through the code. Standard library first, then third-party, then local. Separate groups with blank lines.
 - **Memory**: Prefer smart pointers (`std::unique_ptr`, `std::shared_ptr`). Use `Rc<T>` for GPU resources.
 - **Profiling**: Use `ScopedCpuProfileZone()` / `ScopedGpuProfileZone(ctx, "name")` for performance-critical code.
 - **Comments**:
   - Be as concise as you reasonably can. Most comments should fit into a single line.
+  - Write proper sentences, even when that costs a few words. Do not join clauses with semicolons, and do not use noun-phrase fragments or shorthand that leaves the reader to guess what is meant, such as "Flags at every pixel." or "omitted, it is looked up".
+  - A comment directly above or next to the function, variable or member it describes may leave that subject implied: "Returns the tile's active count.", not "This function returns the tile's active count."
+  - When a comment lists alternate results or cases, give each its own sentence on its own line, like a list: "Returns the slot.", then "Returns the sentinel when the pixel is inactive." on the next line.
+  - When a comment describes a group of declarations or statements inside a longer run of code, put an empty line above the comment and below the group, so the comment's scope is visible.
+  - Break comment lines at natural places whenever possible: after a period, after a comma, or where an idea is finished. Do not end a line with the first word or two of a new sentence, and never leave a single word of a sentence or clause on its own line or at the start of the next one. Prefer pulling the word up onto the previous line, even if it runs a few characters long. If that is too long, break earlier at the start of the clause.
   - Describe the code as it is now. Do not contrast the current state with a previous one, or explain a change.
   - Do not explain things that can easily understood from reading class, function, or variable names.
   - Focus on recording non-obvious interactions and pitfalls.
@@ -69,6 +77,11 @@ Wrap diverging code in comment blocks:
 - New `.cpp` and `.h` files must be added to the `dxvk_src` list in `src/dxvk/meson.build` (alphabetically, both `.cpp` and `.h` on adjacent lines).
 - New shader files (`.comp.slang`, `.rgen.slang`, etc.) are auto-discovered from `src/dxvk/shaders/rtx/` — no build system registration needed.
 
+### Adding New Exports
+
+- Always use REMIXAPI macro for Remix exported functions, do NOT use DLLEXPORT macro.
+- Always use REMIXAPI_CALL macro for calling convention for exported function.
+- Always add new export function shims to d3d9_rtx_shim.cpp for correct shimming on WoA.
 
 ## RTX Options
 
@@ -111,6 +124,7 @@ When modifying shared headers, ensure both C++ and Slang code paths remain consi
 
 ### Slang Conventions
 
+- Declare only one variable per declaration.
 - `mat4x3` for 3x4 matrices (3 rows of 4 columns, row-major in Slang).
 - `f16vec3` / `float16_t` for half-precision where appropriate.
 - `BUFFER_ARRAY(bufferName, bufferIndex, elementIndex)` macro for bindless buffer access.

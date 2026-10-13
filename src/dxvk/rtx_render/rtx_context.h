@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2021-2024, NVIDIA CORPORATION. All rights reserved.
+* Copyright (c) 2021-2026, NVIDIA CORPORATION. All rights reserved.
 *
 * Permission is hereby granted, free of charge, to any person obtaining a
 * copy of this software and associated documentation files (the "Software"),
@@ -179,7 +179,7 @@ namespace dxvk {
 
     void checkOpacityMicromapSupport();
     void checkShaderExecutionReorderingSupport();
-    void checkNeuralRadianceCacheSupport();
+    void checkIndirectLightingSupport();
 
     VkExtent3D setDownscaleExtent(const VkExtent3D& upscaleExtent);
 
@@ -199,7 +199,8 @@ namespace dxvk {
     void dispatchNIS(const Resources::RaytracingOutput& rtOutput);
     void dispatchXeSS(const Resources::RaytracingOutput& rtOutput);
     void dispatchTemporalAA(const Resources::RaytracingOutput& rtOutput);
-    void dispatchToneMapping(const Resources::RaytracingOutput& rtOutput);
+    bool dispatchDlssNR(const Resources::RaytracingOutput& rtOutput);
+    void dispatchToneMapping(const Resources::RaytracingOutput& rtOutput, bool updateAutoExposure = true);
     void dispatchBloom(const Resources::RaytracingOutput& rtOutput);
     void dispatchPostFxMotionBlur(Resources::RaytracingOutput& rtOutput);
     void dispatchPostFxLensEffects(Resources::RaytracingOutput& rtOutput);
@@ -207,7 +208,7 @@ namespace dxvk {
     void dispatchDebugView(Rc<DxvkImage>& srcImage, const Resources::RaytracingOutput& rtOutput, bool captureScreenImage);
     void dispatchObjectPicking(Resources::RaytracingOutput& rtOutput, const VkExtent3D& srcExtent, const VkExtent3D& targetExtent);
     void dispatchDLFG();
-    void updateMetrics(const float gpuIdleTimeMilliseconds) const;
+    void updateMetrics(const float gpuIdleTimeMilliseconds, const bool raytracedThisFrame);
     void rasterizeToSkyMatte(const DrawParameters& params, const DrawCallState& drawCallState);
     void initSkyProbe();
     void rasterizeToSkyProbe(const DrawParameters& params, const DrawCallState& drawCallState);
@@ -226,6 +227,9 @@ namespace dxvk {
     InternalUpscaler m_previousUpscaler = InternalUpscaler::None;
 
     uint32_t m_frameLastInjected = kInvalidFrameIndex;
+    uint32_t m_firstRaytracedFrameId = kInvalidFrameIndex;
+    uint32_t m_lastMetricsFrameId = kInvalidFrameIndex;
+    float m_metricsGpuIdleTimeMs = 0.0f;
     bool m_captureStateForRTX = true;
 
     Rc<DxvkImage> m_skyProbeImage;

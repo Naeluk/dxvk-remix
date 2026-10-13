@@ -22,6 +22,7 @@
 #pragma once
 
 #include "rtx/utility/shader_types.h"
+#include "rtx/pass/sparse_rendering/sparse_rendering.h"
 #ifdef __cplusplus
 #include "rtx/concept/camera/camera.h"
 #else
@@ -31,10 +32,8 @@
 // Inputs
 #define RAY_RECONSTRUCTION_CONSTANTS_INPUT                    0
 
-#define RAY_RECONSTRUCTION_PRIMARY_INDIRECT_SPECULAR_INPUT    3
 #define RAY_RECONSTRUCTION_PRIMARY_ATTENUATION_INPUT          4
 #define RAY_RECONSTRUCTION_PRIMARY_VIRTUAL_WORLD_SHADING_NORMAL_INPUT 5
-#define RAY_RECONSTRUCTION_PRIMARY_CONE_RADIUS_INPUT          6
 #define RAY_RECONSTRUCTION_PRIMARY_DISOCCLUSION_MASK_INPUT    7
 
 #define RAY_RECONSTRUCTION_SECONDARY_ALBEDO_INPUT             10
@@ -59,6 +58,8 @@
 // Constant buffers
 struct RayReconstructionArgs {
   Camera camera;
+
+  SparseRenderingArgs sparseRenderingArgs;
 
   vec4 debugKnob;
 

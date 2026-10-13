@@ -27,6 +27,7 @@
 #include "rtx_light_manager.h"
 #include "rtx_objectpicking.h"
 #include "rtx_option.h"
+#include "rtx_option_manager.h"
 #include "rtx_globals.h"
 #include "rtx_options.h"
 #include "rtx_debug_view.h"
@@ -60,6 +61,7 @@ namespace dxvk {
 
   extern bool g_allowSrgbConversionForOutput;
   extern bool g_forceKeepObjectPickingImage;
+  extern bool g_remixApiEditorModeEnabled;   // defined in rtx_scene_manager.cpp
 
   extern std::array<uint8_t, 3> g_customHighlightColor;
 }
@@ -134,10 +136,6 @@ namespace {
 
     Vector3 tovec3(const remixapi_Float3D& v) {
       return Vector3 { v.x, v.y, v.z };
-    }
-
-    Vector4 tovec4(const remixapi_Float4D& v) {
-      return Vector4 { v.x, v.y, v.z, v.w };
     }
 
     Vector3d tovec3d(const remixapi_Float3D& v) {
@@ -333,7 +331,11 @@ namespace {
           src.getSubsurfaceMaxSampleRadius(),
           src.getFilterMode(),
           src.getWrapModeU(),
-          src.getWrapModeV()
+          src.getWrapModeV(),
+          src.getEnableDLSSControlMask(),
+          src.getDLSSControlMaskIntensity(),
+          src.getDLSSControlMaskToneStrength(),
+          src.getDLSSControlMaskStructuralStrength()
         } };
       }
       case MaterialDataType::Translucent: 
@@ -385,6 +387,7 @@ namespace {
     MaterialData toRtMaterialWithoutTexturePreload(const remixapi_MaterialInfo& info) {
       if (auto extOpaque = pnext::find<remixapi_MaterialInfoOpaqueEXT>(&info)) {
         auto extSubsurface = pnext::find<remixapi_MaterialInfoOpaqueSubsurfaceEXT>(&info);
+        const bool hasDlssControlMask = s_apiVersion >= REMIXAPI_VERSION_MAKE(0, 6, 5);
         return MaterialData { OpaqueMaterialData {
           {},
           {},
@@ -431,6 +434,10 @@ namespace {
           info.filterMode,
           info.wrapModeU,
           info.wrapModeV,
+          hasDlssControlMask ? tobool(extOpaque->enableDlssControlMask) : true,
+          hasDlssControlMask ? extOpaque->dlssControlMaskIntensity : 1.f,
+          hasDlssControlMask ? extOpaque->dlssControlMaskToneStrength : 1.f,
+          hasDlssControlMask ? extOpaque->dlssControlMaskStructuralStrength : 1.f,
         } };
       }
       if (auto extTranslucent = pnext::find<remixapi_MaterialInfoTranslucentEXT>(&info)) {
@@ -1047,7 +1054,8 @@ namespace {
     }
     std::lock_guard lock { s_mutex };
     remixDevice->EmitCs([cHandle = handle](dxvk::DxvkContext* ctx) {
-      ctx->getCommonObjects()->getSceneManager().destroyExternalMesh(cHandle);
+      ctx->getCommonObjects()->getSceneManager()
+        .destroyExternalMesh(dxvk::Rc<dxvk::DxvkContext>(ctx), cHandle);
     });
     return REMIXAPI_ERROR_CODE_SUCCESS;
   }
@@ -1247,8 +1255,15 @@ namespace {
     std::string strKey = std::string{ key };
 
     dxvk::RtxOptionImpl* option = dxvk::RtxOptionImpl::getOptionByFullName(strKey);
-    if (!option) {
-      return REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
+    if (!option || option->isDynamic()) {
+      switch (dxvk::RtxOptionManager::queueDynamicValue(strKey, value)) {
+      case dxvk::DynamicOptionResult::Success:
+        return REMIXAPI_ERROR_CODE_SUCCESS;
+      case dxvk::DynamicOptionResult::InvalidArgument:
+        return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+      default:
+        return REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
+      }
     }
 
     dxvk::Config newSetting;
@@ -1337,6 +1352,7 @@ namespace {
     g_combineGuiInFinalColor = info.combineGuiInFinalColor;
     dxvk::g_allowSrgbConversionForOutput = !info.disableSrgbConversionForOutput;
     dxvk::g_allowMappingLegacyHashToObjectPickingValue = !info.editorModeEnabled;
+    dxvk::g_remixApiEditorModeEnabled = info.editorModeEnabled;
 
     // slightly different initial settings for HdRemix
     if (info.editorModeEnabled) {
@@ -1506,7 +1522,12 @@ namespace {
         srcImage = rtOutput.m_primaryDepth.image;
         break;
       case REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_NORMALS:
-        srcImage = rtOutput.m_primaryWorldShadingNormal.image;
+        // The compacted GBuffer stores normals in compacted order, so it also writes a dense copy for this.
+        if (rtOutput.m_raytraceArgs.sparseRenderingArgs.mode != SparseRenderingMode::Off) {
+          srcImage = rtOutput.m_primaryWorldShadingNormalDense.image;
+        } else {
+          srcImage = rtOutput.m_primaryWorldShadingNormal.image;
+        }
         break;
       case REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_OBJECT_PICKING:
         srcImage = rtOutput.m_primaryObjectPicking.image;

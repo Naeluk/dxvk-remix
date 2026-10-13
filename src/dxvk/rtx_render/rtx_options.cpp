@@ -25,6 +25,7 @@
 #include <nvapi.h>
 #include "../imgui/imgui.h"
 #include "rtx_bridge_message_channel.h"
+#include "rtx_gpu_overrides.h"
 #include "rtx_terrain_baker.h"
 #include "rtx_nee_cache.h"
 #include "rtx_rtxdi_rayquery.h"
@@ -32,6 +33,7 @@
 #include "rtx_composite.h"
 #include "rtx_demodulate.h"
 #include "rtx_neural_radiance_cache.h"
+#include "rtx_spatially_hashed_radiance_cache.h"
 #include "rtx_ray_reconstruction.h"
 #include "../util/util_global_time.h"
 
@@ -50,6 +52,11 @@ namespace dxvk {
       return;
     }
 
+    // TODO[REMIX-1482]: Currently tests expect to skip applying the graphics preset, so this needs to be skipped in test runs.
+    // When we fix tests to actually use the preset, this check should be removed.
+    const bool applyPresets = env::getEnvVar("DXVK_TERMINATE_APP_FRAME") == "" ||
+                              env::getEnvVar("DXVK_GRAPHICS_PRESET_TYPE") != "0";
+
     // When switching to Custom preset, migrate ALL Quality layer settings to User layer.
     // This allows users to customize settings that were previously controlled by the preset.
     // NOTE: this does not run during the initial load due to the device nullptr check above.
@@ -59,18 +66,20 @@ namespace dxvk {
       
       if (qualityLayer && userLayer) {
         // Migrate ALL options from Quality layer to User layer (not just those with the flag)
-        for (auto& [hash, optionPtr] : RtxOptionImpl::getGlobalOptionMap()) {
+        const auto globalRtxOptions = RtxOptionImpl::getGlobalOptionMap();
+        for (auto& [hash, optionPtr] : *globalRtxOptions) {
           optionPtr->moveLayerValue(qualityLayer, userLayer);
         }
         Logger::info("[Graphics Preset] Switched to Custom - Quality settings migrated to User layer");
       }
+      // Per-GPU overrides are not quality settings, so they still refresh on this preset change.
+      if (applyPresets) {
+        GpuOverrides::apply();
+      }
       return;  // Don't apply preset settings when Custom - Quality layer is now empty
     }
 
-    // TODO[REMIX-1482]: Currently tests expect to skip applying the graphics preset, so this needs to be skipped in test runs.
-    // When we fix tests to actually use the preset, the if statement should be removed.
-    if (env::getEnvVar("DXVK_TERMINATE_APP_FRAME") == "" ||
-        env::getEnvVar("DXVK_GRAPHICS_PRESET_TYPE") != "0") {
+    if (applyPresets) {
       RtxOptions::updateGraphicsPresets(device);
     }
   }
@@ -399,11 +408,15 @@ namespace dxvk {
     // Code-driven changes for graphics preset (automatically routes to User layer when preset is Custom)
     RtxOptionLayerTarget layerTarget(RtxOptionEditTarget::Derived);
 
+    // Per-GPU overrides are applied first so the preset and lighting settings below see the effective Ray Reconstruction state.
+    GpuOverrides::apply();
+
     // Handle Automatic Graphics Preset (From configuration/default)
 
     if (RtxOptions::graphicsPreset() == GraphicsPreset::Auto) {
       const DxvkDeviceInfo& deviceInfo = device->adapter()->devicePropertiesExt();
-      const uint32_t vendorID = deviceInfo.core.properties.vendorID;
+      const VkPhysicalDeviceProperties& deviceProperties = deviceInfo.core.properties;
+      const uint32_t vendorID = deviceProperties.vendorID;
       
       // Default updateGraphicsPresets value, don't want to hit this path intentionally or Low settings will be used
       assert(vendorID != 0);
@@ -411,36 +424,27 @@ namespace dxvk {
       Logger::info("Automatic Graphics Preset in use (Set rtx.graphicsPreset to something other than Auto use a non-automatic preset)");
 
       GraphicsPreset preferredDefault = GraphicsPreset::Low;
+      const std::string gpuId = GpuOverrides::formatGpuId(deviceProperties.vendorID, deviceProperties.deviceID);
+      const std::optional<GraphicsPreset> overridePreset = GpuOverrides::findGraphicsPreset(gpuId);
+      const bool hasMatchingOverride = overridePreset.has_value();
 
-      if (vendorID == static_cast<uint32_t>(DxvkGpuVendor::Nvidia)) {
-        const NV_GPU_ARCHITECTURE_ID archId = getNvidiaArch();
+      if (hasMatchingOverride) {
+        preferredDefault = *overridePreset;
+        Logger::info(str::format("[GPU Override] GPU ", gpuId, " (", deviceProperties.deviceName, ") uses graphics preset ",
+                                 GpuOverrides::graphicsPresetName(*overridePreset), "."));
+      }
 
-        if (archId < NV_GPU_ARCHITECTURE_TU100) {
-          // Pre-Turing
-          Logger::info("NVIDIA architecture without HW RTX support detected, setting default graphics settings to Low, but your experience may not be optimal");
-          preferredDefault = GraphicsPreset::Low;
-        } else if (archId < NV_GPU_ARCHITECTURE_GA100) {
-          // Turing
-          Logger::info("NVIDIA Turing architecture detected, setting default graphics settings to Low");
-          preferredDefault = GraphicsPreset::Low;
-        } else if (archId < NV_GPU_ARCHITECTURE_AD100) {
-          // Ampere
-          Logger::info("NVIDIA Ampere architecture detected, setting default graphics settings to Medium");
-          preferredDefault = GraphicsPreset::Medium;
-        } else if (archId < NV_GPU_ARCHITECTURE_GB200) {
-          // Ada
-          Logger::info("NVIDIA Ada architecture detected, setting default graphics settings to High");
-          preferredDefault = GraphicsPreset::High;
-        } else {
-          // Blackwell and beyond
-          Logger::info("NVIDIA Blackwell architecture detected, setting default graphics settings to Ultra");
-          preferredDefault = GraphicsPreset::Ultra;
-        }
-      } else {
-        // Default to low if we don't know the hardware
-        Logger::info("Non-NVIDIA architecture detected, setting default graphics settings to Low");
-        preferredDefault = GraphicsPreset::Low;
+      // The NVAPI architecture query only runs when the discrete-GPU heuristics use it.
+      const bool isRtxSpark = GpuProfile::isRtxSpark();
+      const bool needsArch = !hasMatchingOverride && !isRtxSpark && vendorID == static_cast<uint32_t>(DxvkGpuVendor::Nvidia);
+      const uint32_t archId = needsArch ? static_cast<uint32_t>(getNvidiaArch()) : 0;
+      const AutoPresetDecision decision = selectAutoPreset(GpuProfile::getHardwareInfo(), overridePreset, archId);
+      for (const std::string& line : decision.log) {
+        Logger::info(line);
+      }
+      preferredDefault = decision.preset;
 
+      if (decision.applyNonNvidiaDefaults) {
         // Setup some other known good defaults for other IHVs.
         RtxOptions::resolutionScale.setDeferred(0.5f);
         // Todo: Currently this code is needed to allow the the non-DLSS upscaling paths to reflect the
@@ -451,25 +455,7 @@ namespace dxvk {
         RtxOptions::nisPreset.setDeferred(NisPreset::Performance);
         RtxOptions::taauPreset.setDeferred(TaauPreset::Performance);
       }
-
-      // figure out how much vidmem we have
-      VkPhysicalDeviceMemoryProperties memProps = device->adapter()->memoryProperties();
-      VkDeviceSize vidMemSize = 0;
-      for (uint32_t i = 0; i < memProps.memoryTypeCount; i++) {
-        if (memProps.memoryTypes[i].propertyFlags == VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
-          vidMemSize = memProps.memoryHeaps[memProps.memoryTypes[i].heapIndex].size;
-          break;
-        }
-      }
-
-      // for 8GB GPUs we lower the quality even further.
-      if (vidMemSize <= 8ull * 1024 * 1024 * 1024) {
-        Logger::info("8GB GPU detected, lowering quality setting.");
-        preferredDefault = (GraphicsPreset)std::clamp((int)preferredDefault + 1, (int) GraphicsPreset::Medium, (int) GraphicsPreset::Low);
-        RtxOptions::lowMemoryGpu.setDeferred(true);
-      } else {
-        RtxOptions::lowMemoryGpu.setDeferred(false);
-      }
+      RtxOptions::lowMemoryGpu.setDeferred(decision.lowMemoryGpu);
 
       // graphicsPreset itself should go to User layer, not Quality layer
       // (graphicsPreset controls what goes into Quality, it's not controlled BY Quality)
@@ -502,14 +488,27 @@ namespace dxvk {
       postFx.enable.setDeferred(false);
     };
 
-    auto enableNrcPreset = [&](NeuralRadianceCache::QualityPreset nrcPreset) {
-      NeuralRadianceCache& nrc = device->getCommon()->metaNeuralRadianceCache();
-      // TODO[REMIX-4105] trying to use NRC for a frame when it isn't supported will cause a crash, so this needs to be setImmediately.
-      // Should refactor this to use a separate global for the final state, and indicate user preference with the option. 
-      if (nrc.checkIsSupported(device)) {
-        RtxOptions::integrateIndirectMode.setImmediately(IntegrateIndirectMode::NeuralRadianceCache);
-        nrc.setQualityPreset(nrcPreset);
+    auto applyIndirectPreset = [&](NeuralRadianceCache::QualityPreset nrcPreset, SpatiallyHashedRadianceCache::QualityPreset sharcPreset) {
+      // Preserve ReSTIR GI selected by a cache support fallback.
+      if (RtxOptions::integrateIndirectMode() == IntegrateIndirectMode::ReSTIRGI) {
+        return;
+      }
+
+      if (RtxOptions::integrateIndirectMode() == IntegrateIndirectMode::NeuralRadianceCache) {
+        if (NeuralRadianceCache::checkIsSupported(device)) {
+          RtxOptions::integrateIndirectMode.setImmediately(IntegrateIndirectMode::NeuralRadianceCache);
+          common->metaNeuralRadianceCache().setQualityPreset(nrcPreset);
+        } else {
+          Logger::warn("[RTX] Neural Radiance Cache is not supported. Switching indirect illumination mode to ReSTIR GI.");
+          RtxOptions::integrateIndirectMode.setImmediately(IntegrateIndirectMode::ReSTIRGI);
+        }
+      } else if (SpatiallyHashedRadianceCache::checkIsSupported(device)) {
+        RtxOptions::integrateIndirectMode.setImmediately(IntegrateIndirectMode::SHaRC);
+        using SharcOptions = SpatiallyHashedRadianceCache::SharcOptions;
+        SharcOptions::qualityPreset.setImmediately(sharcPreset);
+        SharcOptions::onQualityPresetChanged(device);
       } else {
+        Logger::warn("[RTX] SHaRC requires shaderInt64 and shaderBufferInt64Atomics. Switching to ReSTIR GI.");
         RtxOptions::integrateIndirectMode.setImmediately(IntegrateIndirectMode::ReSTIRGI);
       }
     };
@@ -537,7 +536,7 @@ namespace dxvk {
       postFx.enable.setDeferred(true);
 
       volumetrics.setQualityLevel(RtxGlobalVolumetrics::Ultra);
-      enableNrcPreset(NeuralRadianceCache::QualityPreset::Ultra);
+      applyIndirectPreset(NeuralRadianceCache::QualityPreset::Ultra, SpatiallyHashedRadianceCache::QualityPreset::Ultra);
 
     } else if (graphicsPreset() == GraphicsPreset::High) {
       pathMinBounces.setDeferred(0);
@@ -558,7 +557,7 @@ namespace dxvk {
       russianRoulette1stBounceMinContinueProbability.setDeferred(0.6f);
 
       volumetrics.setQualityLevel(RtxGlobalVolumetrics::High);
-      enableNrcPreset(NeuralRadianceCache::QualityPreset::High);
+      applyIndirectPreset(NeuralRadianceCache::QualityPreset::High, SpatiallyHashedRadianceCache::QualityPreset::High);
 
     } else if (graphicsPreset() == GraphicsPreset::Medium) {
       lowGraphicsPresetCommonSettings();
@@ -567,7 +566,7 @@ namespace dxvk {
       russianRoulette1stBounceMinContinueProbability.setDeferred(0.4f);
 
       volumetrics.setQualityLevel(RtxGlobalVolumetrics::Medium);
-      enableNrcPreset(NeuralRadianceCache::QualityPreset::Medium);
+      applyIndirectPreset(NeuralRadianceCache::QualityPreset::Medium, SpatiallyHashedRadianceCache::QualityPreset::Medium);
     } else if (graphicsPreset() == GraphicsPreset::Low) {
       lowGraphicsPresetCommonSettings();
 
@@ -575,7 +574,7 @@ namespace dxvk {
       russianRoulette1stBounceMinContinueProbability.setDeferred(0.4f);
 
       volumetrics.setQualityLevel(RtxGlobalVolumetrics::Low);
-      enableNrcPreset(NeuralRadianceCache::QualityPreset::Medium);
+      applyIndirectPreset(NeuralRadianceCache::QualityPreset::Medium, SpatiallyHashedRadianceCache::QualityPreset::Medium);
       
     }
 

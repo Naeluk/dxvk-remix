@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2022-2024, NVIDIA CORPORATION. All rights reserved.
+* Copyright (c) 2022-2026, NVIDIA CORPORATION. All rights reserved.
 *
 * Permission is hereby granted, free of charge, to any person obtaining a
 * copy of this software and associated documentation files (the "Software"),
@@ -33,6 +33,16 @@
 #define GBUFFER_BINDING_SKYMATTE                                                39
 #define GBUFFER_BINDING_VOLUME_FILTERED_RADIANCE_Y_INPUT                        40
 #define GBUFFER_BINDING_VOLUME_FILTERED_RADIANCE_CO_CG_INPUT                    41
+// Maps a pixel to its slot in the compacted GBuffer, if the pixel has one.
+#define GBUFFER_BINDING_COMPACTED_PIXEL_INDICES_INPUT                           51
+// The GBuffer seeds radiance cache update paths from this resolved query-pixel map.
+#define GBUFFER_BINDING_RADIANCE_CACHE_UPDATE_QUERY_RESERVOIR_INPUT             52
+#define GBUFFER_BINDING_TILE_ACTIVE_COUNTS_INPUT                                53
+
+// Input / Output
+#define GBUFFER_BINDING_BINDING_SHARC_HASH_ENTRIES_INPUT_OUTPUT                 54
+#define GBUFFER_BINDING_BINDING_SHARC_ACCUMULATION_INPUT_OUTPUT                 55
+#define GBUFFER_BINDING_BINDING_SHARC_RESOLVED_INPUT_OUTPUT                     56
 
 // Outputs
 
@@ -78,10 +88,7 @@
 #define GBUFFER_BINDING_SHARED_BIAS_CURRENT_COLOR_MASK_OUTPUT                  102
 
 #define GBUFFER_BINDING_REFLECTION_PSR_DATA_STORAGE_2                          103
-#define GBUFFER_BINDING_TRANSMISSION_PSR_DATA_STORAGE_0                        104
-#define GBUFFER_BINDING_TRANSMISSION_PSR_DATA_STORAGE_1                        105
-#define GBUFFER_BINDING_TRANSMISSION_PSR_DATA_STORAGE_2                        106
-#define GBUFFER_BINDING_TRANSMISSION_PSR_DATA_STORAGE_3                        107
+#define GBUFFER_BINDING_TRANSMISSION_PSR_DATA_STORAGE                          104
 
 #define GBUFFER_BINDING_ALPHA_BLEND_GBUFFER_OUTPUT                             108
 #define GBUFFER_BINDING_SHARED_TEXTURE_COORD_OUTPUT                            109
@@ -101,6 +108,7 @@
 #define GBUFFER_BINDING_PRIMARY_DEPTH_DLSSRR_OUTPUT                             120
 #define GBUFFER_BINDING_PRIMARY_NORMAL_DLSSRR_OUTPUT                            121
 #define GBUFFER_BINDING_PRIMARY_SCREEN_SPACE_MOTION_DLSSRR_OUTPUT               122
+#define GBUFFER_BINDING_DLSS_NR_CONTROL_MASK_OUTPUT                             124
 
 #define GBUFFER_BINDING_NRC_QUERY_PATH_INFO_OUTPUT                              130
 #define GBUFFER_BINDING_NRC_TRAINING_PATH_INFO_OUTPUT                           131
@@ -111,11 +119,23 @@
 #define GBUFFER_BINDING_NRC_QUERY_PATH_DATA0_OUTPUT                             135
 #define GBUFFER_BINDING_NRC_QUERY_PATH_DATA1_OUTPUT                             136
 #define GBUFFER_BINDING_NRC_TRAINING_PATH_DATA1_OUTPUT                          138
-#define GBUFFER_BINDING_NRC_TRAINING_GBUFFER_SURFACE_RADIANCE_RG_OUTPUT         140
-#define GBUFFER_BINDING_NRC_TRAINING_GBUFFER_SURFACE_RADIANCE_B_OUTPUT          141
+#define GBUFFER_BINDING_RADIANCE_CACHE_UPDATE_GBUFFER_SURFACE_RADIANCE_RG_OUTPUT 140
+#define GBUFFER_BINDING_RADIANCE_CACHE_UPDATE_GBUFFER_SURFACE_RADIANCE_B_OUTPUT  141
 
 #define GBUFFER_BINDING_PRIMARY_OBJECT_PICKING_OUTPUT                           150
 
+// Holds the dense copy of the flags, which only the compacted GBuffer uses.
+#define GBUFFER_BINDING_SHARED_FLAGS_DENSE_OUTPUT                               152
+
+// With the compacted GBuffer, the GBuffer writes these dense guides for every pixel.
+// Otherwise prepare RR builds them.
+#define GBUFFER_BINDING_PRIMARY_ALBEDO_DLSSRR_OUTPUT                            153
+#define GBUFFER_BINDING_PRIMARY_SPECULAR_ALBEDO_DLSSRR_OUTPUT                   154
+
+#define GBUFFER_BINDING_PRIMARY_WORLD_POSITION_COMPACTED_OUTPUT                 155
+
+// Holds the dense copy of the primary shading normal, which only the compacted GBuffer writes for the Remix API.
+#define GBUFFER_BINDING_PRIMARY_WORLD_SHADING_NORMAL_DENSE_OUTPUT               156
 
 #define GBUFFER_MIN_BINDING                         GBUFFER_BINDING_LINEAR_WRAP_SAMPLER
 
@@ -127,6 +147,5 @@
 
 struct GbufferPushConstants
 {
-  uint isTransmissionPSR;
   uint usePSRPrepare;
 };

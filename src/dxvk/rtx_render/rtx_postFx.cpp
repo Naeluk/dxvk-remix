@@ -96,7 +96,7 @@ namespace dxvk {
         BEGIN_PARAMETER()
         TEXTURE2D(POST_FX_HIGHLIGHT_INPUT)
         RW_TEXTURE2D(POST_FX_HIGHLIGHT_OBJECT_PICKING_INPUT)
-        TEXTURE2D(POST_FX_HIGHLIGHT_PRIMARY_CONE_RADIUS_INPUT)
+        TEXTURE2D(POST_FX_HIGHLIGHT_PRIMARY_LINEAR_VIEW_Z_INPUT)
         RW_TEXTURE2D(POST_FX_HIGHLIGHT_OUTPUT)
         STRUCTURED_BUFFER(POST_FX_HIGHLIGHT_VALUES)
         END_PARAMETER()
@@ -301,20 +301,22 @@ namespace dxvk {
 
     ctx->setPushConstantBank(DxvkPushConstantBank::RTX);
 
+    const Resources::Resource& postFxIntermediateTexture =
+      rtOutput.m_postFxIntermediateTexture.resource(Resources::AccessType::Write);
     dispatchMotionBlurInternal(
       ctx,
       nearestSampler, linearSampler,
       postFxArgs,
       workgroups,
       rtOutput,
-      inOutColorTexture, rtOutput.m_postFxIntermediateTexture);
+      inOutColorTexture, postFxIntermediateTexture);
 
     // Copy the blurred result back into the final output so downstream passes can read it.
     ctx->copyImage(
       inOutColorTexture.image,
       { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
       { 0, 0, 0 },
-      rtOutput.m_postFxIntermediateTexture.image,
+      rtOutput.m_postFxIntermediateTexture.image(Resources::AccessType::Read),
       { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
       { 0, 0, 0 },
       inputSize);
@@ -355,8 +357,10 @@ namespace dxvk {
 
     ctx->setPushConstantBank(DxvkPushConstantBank::RTX);
 
+    const Resources::Resource& postFxIntermediateTexture =
+      rtOutput.m_postFxIntermediateTexture.resource(Resources::AccessType::Write);
     dispatchPostLensEffects(ctx, linearSampler, postFxArgs, workgroups,
-                            inOutColorTexture, rtOutput.m_postFxIntermediateTexture);
+                            inOutColorTexture, postFxIntermediateTexture);
 
     // The lens-effect shader uses a Sampler2D input and an RWTexture2D output. To keep the
     // input/output decoupled (and avoid sampling-while-writing hazards) we write into the
@@ -365,7 +369,7 @@ namespace dxvk {
       inOutColorTexture.image,
       { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
       { 0, 0, 0 },
-      rtOutput.m_postFxIntermediateTexture.image,
+      rtOutput.m_postFxIntermediateTexture.image(Resources::AccessType::Read),
       { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
       { 0, 0, 0 },
       inputSize);
@@ -470,15 +474,17 @@ namespace dxvk {
         color == HighlightColor::FromVariable ? packColor(g_customHighlightColor[0], g_customHighlightColor[1], g_customHighlightColor[2]) :
         packColor(255, 255, 255);
       args.valuesToHighlightCountPow = valuesToHighlightCountPow;
+      args.missLinearViewZ = rtOutput.m_raytraceArgs.primaryDirectMissLinearViewZ;
     }
 
     ctx->pushConstants(0, sizeof(args), &args);
 
-    const Resources::Resource* lastOutput = &rtOutput.m_postFxIntermediateTexture;
+    const Resources::Resource* lastOutput =
+      &rtOutput.m_postFxIntermediateTexture.resource(Resources::AccessType::Write);
 
     ctx->bindResourceView(POST_FX_HIGHLIGHT_INPUT, inOutColorTexture.view, nullptr);
     ctx->bindResourceView(POST_FX_HIGHLIGHT_OBJECT_PICKING_INPUT, rtOutput.m_primaryObjectPicking.view, nullptr);
-    ctx->bindResourceView(POST_FX_HIGHLIGHT_PRIMARY_CONE_RADIUS_INPUT, rtOutput.m_primaryConeRadius.view, nullptr);
+    ctx->bindResourceView(POST_FX_HIGHLIGHT_PRIMARY_LINEAR_VIEW_Z_INPUT, rtOutput.m_primaryLinearViewZ.view, nullptr);
     ctx->bindResourceView(POST_FX_HIGHLIGHT_OUTPUT, lastOutput->view, nullptr);
     ctx->bindResourceBuffer(POST_FX_HIGHLIGHT_VALUES, DxvkBufferSlice(m_highlightingValues, 0, m_highlightingValues->info().size));
 
@@ -491,7 +497,7 @@ namespace dxvk {
         inOutColorTexture.image,
         { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
         { 0, 0, 0 },
-        rtOutput.m_postFxIntermediateTexture.image,
+        rtOutput.m_postFxIntermediateTexture.image(Resources::AccessType::Read),
         { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
         { 0, 0, 0 },
         inputSize);

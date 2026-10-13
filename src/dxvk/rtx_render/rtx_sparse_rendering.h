@@ -47,10 +47,11 @@ namespace dxvk {
         "WhiteNoise (0): wangHash ~ white-noise.\n"
         "BlueNoise128x128x64x8 (1): 8 bit 128x128 blue-noise 64 frame length.");
 
-      RTX_OPTION_ARGS("rtx.sparseRendering", float, samplingRate, 1.0f,
-        "Per-pixel sampling rate shared by primary direct and indirect lighting.\n"
+      RTX_OPTION_ARGS("rtx.sparseRendering", float, samplingRate, 0.2f,
+        "Per-pixel sampling rate applied across the whole pipeline.\n"
         "Lower values boost performance at the cost of image detail and temporal stability.\n"
-        "Range [0.0625, 1.0]. Rates below ~0.2 tend to look bad and yield diminishing perf returns.",
+        "Range [0.0625, 1.0]. Rates below ~0.2 tend to look bad and yield diminishing perf returns.\n"
+        "Rates near 1.0 leave sparse rendering off, since the compacted GBuffer storage cannot hold that many active pixels.",
         args.environment = "RTX_SPARSE_RENDERING_SAMPLING_RATE",
         // 1/255 is the absolute minimum, but 1/16 is a more reasonable lower bound for image quality. Even 1/16 will show temporal instabilities but tends to not be catastrophic.
         // Second, there are diminishing returns on performance with lower rates so aggressive rates don't provide much more performance but can cause very bad image quality.
@@ -78,31 +79,30 @@ namespace dxvk {
         args.maxValue = 1.0f,
         args.onChangeCallback = &deprecatedSamplingRateOnChange);
 
-      RTX_OPTION("rtx.sparseRendering", bool, enableSparsePrimaryRayMissComposition, false,
+      RTX_OPTION("rtx.sparseRendering", bool, enableSparsePrimaryRayMissComposition, true,
         "When enabled, primary miss pixels (sky) use sparse rendering.\n"
         "This improves performance at the cost of sky reconstruction artifacts.");
-
-      RTX_OPTION("rtx.sparseRendering", bool, enableSparseSecondaryLighting, false,
-        "When enabled, secondary surfaces (PSR glass reflections) use sparse rendering.\n"
-        "This improves performance at the cost of potential sparse NRD denoising artifacts on glass.\n"
-        "This option is in development and may not produce good denoised results.");
-
-      RTX_OPTION("rtx.sparseRendering", bool, enableRtxdiReuseForInactivePixels, false,
-        "Enables RTXDI reservoir reuse (temporal reprojection and spatial reuse) on inactive pixels.\n"
-        "Disabling improves performance and, counterintuitively, has been observed to reduce ghosting."
-        "In theory it can increase direct lighting noise under animated lighting.");
 
       RTX_OPTION("rtx.sparseRendering", bool, enableSparseVolumetricsPrimaryHit, true,
         "When enabled, volumetric NEE integration at primary-hit pixels uses sparse rendering.");
 
-      RTX_OPTION("rtx.sparseRendering", bool, enableSparseVolumetricsPrimaryMiss, false,
+      RTX_OPTION("rtx.sparseRendering", bool, enableSparseVolumetricsPrimaryMiss, true,
         "When enabled, volumetric NEE integration at primary-miss (sky) pixels uses sparse rendering.");
-
-      RTX_OPTION("rtx.sparseRendering", bool, enableSparsePrimarySpecularAlbedo, false,
-        "When enabled, the primary specular albedo guide for DLSS Ray Reconstruction is written sparsely: active pixels get\n"
-        "the computed specular albedo, inactive primary-hit pixels are zeroed. When disabled (default), the guide is computed\n"
-        "and written densely for every primary-hit pixel so RR sees a clean dense signal.");
     };
+
+    // Describes the placement of the compacted storage. Holds the extent that the compacted resources are allocated at
+    // and the two parameters that map a global compacted index into that extent.
+    // Falls back to the render extent with no capacity when sparse rendering is disabled or the storage cannot be packed,
+    // which keeps sparse rendering off.
+    struct CompactedStorageLayout {
+      VkExtent3D extent;
+      uint32_t squaresPerRow;
+      uint32_t capacity;
+    };
+
+    // Derives the layout from the render extent, the options and isEnabledAndSupported,
+    // so the resources and the shader args cannot disagree.
+    CompactedStorageLayout calculateCompactedStorageLayout(const VkExtent3D& downscaledExtent) const;
 
     SparseRendering(dxvk::DxvkDevice* device);
 
@@ -113,7 +113,10 @@ namespace dxvk {
     static bool isEnabledByOptions();
 
     bool resamplesNrcTrainingPaths(bool nrcIsActive) const;
-    static bool shouldDeferNrcTrainingSetup(const SparseRenderingArgs& args);
+
+    // Launches a compute pass over the active-pixel list under sparse rendering.
+    // Launches it over the given workgroups when sparse rendering is off.
+    static void dispatchCompactedConsumer(RtxContext& ctx, const Resources::RaytracingOutput& rtOutput, const VkExtent3D& workgroups);
 
     void showImguiSettings();
     void dispatch(RtxContext& ctx, const Resources::RaytracingOutput& rtOutput);
@@ -122,16 +125,24 @@ namespace dxvk {
 
   protected:
     bool isEnabled() const override;
-    bool onActivation(Rc<DxvkContext>& ctx) override;
     void onFrameBegin(Rc<DxvkContext>& ctx, const FrameBeginContext& frameBeginCtx) override;
     void createDownscaledResource(Rc<DxvkContext>& ctx, const VkExtent3D& downscaledExtent) override;
     void releaseDownscaledResource() override;
 
   private:
+    // Returns whether sparse rendering can run on this device and configuration.
+    // Leaves out only the storage capacity check, because the capacity is sized from this result.
+    // Resources are compacted exactly when this holds, so the dense GBuffer path never sees compacted resources.
+    bool isEnabledAndSupported() const;
+
+    static float calculateCapacityRate(uint32_t pixelCount);
+
     void dispatchActivePixelSamplingRate(RtxContext& ctx, const Resources::RaytracingOutput& rtOutput);
     void dispatchActivePixelMask(RtxContext& ctx, const Resources::RaytracingOutput& rtOutput);
     void dispatchCompactActivePixels(RtxContext& ctx, const Resources::RaytracingOutput& rtOutput);
     bool checkCompactActivePixelsRequirements() const;
+    bool checkCompactedLaunchLimits(uint32_t maxLaunchPixels) const;
+    void allocateActivePixelListBuffers(Rc<DxvkContext>& ctx, Resources::RaytracingOutput& rtOutput) const;
 
     VkExtent3D m_activePixelMaskExtent = { 0u, 0u, 0u };
   };

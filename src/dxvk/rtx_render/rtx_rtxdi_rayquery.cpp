@@ -30,6 +30,7 @@
 #include "rtx/pass/rtxdi/rtxdi_compute_gradients_bindings.h"
 #include "rtx/pass/rtxdi/rtxdi_filter_gradients_bindings.h"
 #include "rtx/pass/rtxdi/rtxdi_compute_confidence_bindings.h"
+#include "rtx/pass/sparse_rendering/compact_active_pixels_binding_indices.h"
 #include "rtxdi/RtxdiParameters.h"
 #include "dxvk_scoped_annotation.h"
 #include "dxvk_context.h"
@@ -88,7 +89,15 @@ namespace dxvk {
         TEXTURE2D(RTXDI_REUSE_BINDING_SUBSURFACE_DIFFUSION_PROFILE_DATA_INPUT)
         TEXTURE2D(RTXDI_REUSE_BINDING_SHARED_FLAGS_INPUT)
         TEXTURE2D(RTXDI_REUSE_BINDING_BEST_LIGHTS_INPUT)
-        TEXTURE2D(RTXDI_REUSE_BINDING_ACTIVE_LOCAL_PIXEL_COORDS_INPUT)
+        TEXTURE2D(RTXDI_REUSE_BINDING_COMPACTED_PIXEL_INDICES_INPUT)
+        TEXTURE2D(RTXDI_REUSE_BINDING_TILE_ACTIVE_COUNTS_INPUT)
+        STRUCTURED_BUFFER(RTXDI_REUSE_BINDING_ACTIVE_PIXEL_COORDS_INPUT)
+        STRUCTURED_BUFFER(RTXDI_REUSE_BINDING_ACTIVE_PIXEL_COUNT_INPUT)
+        TEXTURE2D(RTXDI_REUSE_BINDING_WORLD_POSITION_DENSE_INPUT)
+        TEXTURE2D(RTXDI_REUSE_BINDING_SHARED_FLAGS_DENSE_INPUT)
+        TEXTURE2D(RTXDI_REUSE_BINDING_LINEAR_VIEW_Z_INPUT)
+        TEXTURE2D(RTXDI_REUSE_BINDING_WORLD_SHADING_NORMAL_DENSE_INPUT)
+        TEXTURE2D(RTXDI_REUSE_BINDING_ALBEDO_DENSE_INPUT)
 
         // Inputs / Outputs
         RW_STRUCTURED_BUFFER(RTXDI_REUSE_BINDING_RTXDI_RESERVOIR_INPUT_OUTPUT)
@@ -131,7 +140,15 @@ namespace dxvk {
         TEXTURE2D(RTXDI_REUSE_BINDING_SHARED_TERMINATOR_FIX_PREVIOUS_INPUT)
         TEXTURE2D(RTXDI_REUSE_BINDING_SHARED_FLAGS_INPUT)
         TEXTURE2D(RTXDI_REUSE_BINDING_BEST_LIGHTS_INPUT)
-        TEXTURE2D(RTXDI_REUSE_BINDING_ACTIVE_LOCAL_PIXEL_COORDS_INPUT)
+        TEXTURE2D(RTXDI_REUSE_BINDING_COMPACTED_PIXEL_INDICES_INPUT)
+        TEXTURE2D(RTXDI_REUSE_BINDING_TILE_ACTIVE_COUNTS_INPUT)
+        STRUCTURED_BUFFER(RTXDI_REUSE_BINDING_ACTIVE_PIXEL_COORDS_INPUT)
+        STRUCTURED_BUFFER(RTXDI_REUSE_BINDING_ACTIVE_PIXEL_COUNT_INPUT)
+        TEXTURE2D(RTXDI_REUSE_BINDING_WORLD_POSITION_DENSE_INPUT)
+        TEXTURE2D(RTXDI_REUSE_BINDING_SHARED_FLAGS_DENSE_INPUT)
+        TEXTURE2D(RTXDI_REUSE_BINDING_LINEAR_VIEW_Z_INPUT)
+        TEXTURE2D(RTXDI_REUSE_BINDING_WORLD_SHADING_NORMAL_DENSE_INPUT)
+        TEXTURE2D(RTXDI_REUSE_BINDING_ALBEDO_DENSE_INPUT)
         
         // Inputs / Outputs
         RW_STRUCTURED_BUFFER(RTXDI_REUSE_BINDING_RTXDI_RESERVOIR_INPUT_OUTPUT)
@@ -174,7 +191,15 @@ namespace dxvk {
         TEXTURE2D(RTXDI_REUSE_BINDING_SHARED_TERMINATOR_FIX_PREVIOUS_INPUT)
         TEXTURE2D(RTXDI_REUSE_BINDING_SHARED_FLAGS_INPUT)
         TEXTURE2D(RTXDI_REUSE_BINDING_BEST_LIGHTS_INPUT)
-        TEXTURE2D(RTXDI_REUSE_BINDING_ACTIVE_LOCAL_PIXEL_COORDS_INPUT)
+        TEXTURE2D(RTXDI_REUSE_BINDING_COMPACTED_PIXEL_INDICES_INPUT)
+        TEXTURE2D(RTXDI_REUSE_BINDING_TILE_ACTIVE_COUNTS_INPUT)
+        STRUCTURED_BUFFER(RTXDI_REUSE_BINDING_ACTIVE_PIXEL_COORDS_INPUT)
+        STRUCTURED_BUFFER(RTXDI_REUSE_BINDING_ACTIVE_PIXEL_COUNT_INPUT)
+        TEXTURE2D(RTXDI_REUSE_BINDING_WORLD_POSITION_DENSE_INPUT)
+        TEXTURE2D(RTXDI_REUSE_BINDING_SHARED_FLAGS_DENSE_INPUT)
+        TEXTURE2D(RTXDI_REUSE_BINDING_LINEAR_VIEW_Z_INPUT)
+        TEXTURE2D(RTXDI_REUSE_BINDING_WORLD_SHADING_NORMAL_DENSE_INPUT)
+        TEXTURE2D(RTXDI_REUSE_BINDING_ALBEDO_DENSE_INPUT)
 
         // Inputs / Outputs
         RW_STRUCTURED_BUFFER(RTXDI_REUSE_BINDING_RTXDI_RESERVOIR_INPUT_OUTPUT)
@@ -385,6 +410,12 @@ namespace dxvk {
       return false;
     }
 
+    // Without the gradient resources the reservoir buffer keeps a single history page, leaving no previous frame
+    // to compare against. They follow the consumers' options, see Resources::needsRtxdiGradientResources.
+    if (!ctx.getResourceManager().areRtxdiGradientResourcesAllocated()) {
+      return false;
+    }
+
     return true;
   }
 
@@ -412,7 +443,8 @@ namespace dxvk {
     const uint32_t frameIdx = ctx->getDevice()->getCurrentFrameId();
 
     const auto& numRaysExtent = rtOutput.m_compositeOutputExtent;
-    VkExtent3D workgroups = util::computeBlockCount(numRaysExtent, VkExtent3D{ 16, 8, 1 });
+    VkExtent3D workgroups = util::computeBlockCount(numRaysExtent,
+      VkExtent3D{ COMPACT_ACTIVE_PIXELS_CONSUMER_GROUP_SIZE_X, COMPACT_ACTIVE_PIXELS_CONSUMER_GROUP_SIZE_Y, 1 });
     const bool usePortalShaderVariants = useRtxdiPortalShaderVariants();
 
     ctx->bindCommonRayTracingResources(rtOutput);
@@ -429,7 +461,7 @@ namespace dxvk {
       ctx->bindResourceView(RTXDI_REUSE_BINDING_ALBEDO_INPUT, rtOutput.m_primaryAlbedo.view, nullptr);
       // Note: Texture contains Base Reflectivity here (due to being before the demodulate pass)
       ctx->bindResourceView(RTXDI_REUSE_BINDING_BASE_REFLECTIVITY_INPUT, rtOutput.m_primaryBaseReflectivity.view(Resources::AccessType::Read), nullptr);
-      ctx->bindResourceView(RTXDI_REUSE_BINDING_WORLD_POSITION_INPUT, rtOutput.getCurrentPrimaryWorldPositionWorldTriangleNormal().view(Resources::AccessType::Read), nullptr);
+      ctx->bindResourceView(RTXDI_REUSE_BINDING_WORLD_POSITION_INPUT, rtOutput.getCompactedPrimaryWorldPositionWorldTriangleNormal().view(Resources::AccessType::Read), nullptr);
       ctx->bindResourceView(RTXDI_REUSE_BINDING_PREV_WORLD_POSITION_INPUT, rtOutput.getPreviousPrimaryWorldPositionWorldTriangleNormal().view(Resources::AccessType::Read, rtOutput.getPreviousPrimaryWorldPositionWorldTriangleNormal().matchesWriteFrameIdx(frameIdx - 1)), nullptr);
       ctx->bindResourceView(RTXDI_REUSE_BINDING_WS_MVEC_INPUT, rtOutput.m_primaryVirtualMotionVector.view(Resources::AccessType::Read), nullptr);
       ctx->bindResourceView(RTXDI_REUSE_BINDING_SS_MVEC_INPUT, rtOutput.m_primaryScreenSpaceMotionVector.view, nullptr);
@@ -443,29 +475,53 @@ namespace dxvk {
       ctx->bindResourceView(RTXDI_REUSE_BINDING_SHARED_TERMINATOR_FIX_PREVIOUS_INPUT, rtOutput.getPreviousSharedTerminatorFix().view, nullptr);
       ctx->bindResourceView(RTXDI_REUSE_BINDING_SHARED_FLAGS_INPUT, rtOutput.m_sharedFlags.view, nullptr);
       ctx->bindResourceView(RTXDI_REUSE_BINDING_BEST_LIGHTS_INPUT, rtOutput.m_rtxdiBestLights.view(Resources::AccessType::Read, rtOutput.m_raytraceArgs.enableRtxdiBestLightSampling) , nullptr);
-      ctx->bindResourceView(RTXDI_REUSE_BINDING_ACTIVE_LOCAL_PIXEL_COORDS_INPUT, rtOutput.m_sparseRenderingActiveLocalPixelCoords.view, nullptr);
+      ctx->bindResourceView(RTXDI_REUSE_BINDING_COMPACTED_PIXEL_INDICES_INPUT, rtOutput.m_sparseRenderingCompactedPixelIndices.view, nullptr);
+      ctx->bindResourceView(RTXDI_REUSE_BINDING_TILE_ACTIVE_COUNTS_INPUT, rtOutput.m_sparseRenderingTileActiveCounts.view, nullptr);
+      ctx->bindResourceBuffer(RTXDI_REUSE_BINDING_ACTIVE_PIXEL_COORDS_INPUT, optionalBufferSlice(rtOutput.m_sparseRenderingActivePixelCoords));
+      ctx->bindResourceBuffer(RTXDI_REUSE_BINDING_ACTIVE_PIXEL_COUNT_INPUT, optionalBufferSlice(rtOutput.m_sparseRenderingActivePixelCount));
+
+      // Spatial reuse rebuilds inactive neighbors from these. See RAB_GetInactiveGBufferSurface.
+      const bool compactedGBuffer = rtOutput.m_raytraceArgs.sparseRenderingArgs.mode != SparseRenderingMode::Off;
+      ctx->bindResourceView(RTXDI_REUSE_BINDING_WORLD_POSITION_DENSE_INPUT, rtOutput.getCurrentPrimaryWorldPositionWorldTriangleNormal().view(Resources::AccessType::Read), nullptr);
+      ctx->bindResourceView(RTXDI_REUSE_BINDING_SHARED_FLAGS_DENSE_INPUT,
+        compactedGBuffer
+          ? rtOutput.m_sharedFlagsDense.view(Resources::AccessType::Read)
+          : nullptr, nullptr);
+      ctx->bindResourceView(RTXDI_REUSE_BINDING_LINEAR_VIEW_Z_INPUT, rtOutput.m_primaryLinearViewZ.view, nullptr);
+      ctx->bindResourceView(RTXDI_REUSE_BINDING_WORLD_SHADING_NORMAL_DENSE_INPUT,
+        compactedGBuffer
+          ? rtOutput.m_primaryWorldShadingNormalDense.view
+          : nullptr, nullptr);
+      ctx->bindResourceView(RTXDI_REUSE_BINDING_ALBEDO_DENSE_INPUT,
+        compactedGBuffer
+          ? rtOutput.m_primaryAlbedoDLSSRR.view
+          : nullptr, nullptr);
 
       // Inputs / Outputs
 
-      ctx->bindResourceBuffer(RTXDI_REUSE_BINDING_RTXDI_RESERVOIR_INPUT_OUTPUT, DxvkBufferSlice(rtOutput.m_rtxdiReservoirBuffer, 0, rtOutput.m_rtxdiReservoirBuffer->info().size));
+      // Initial sampling writes the scratch page before temporal reuse reads the history, so this takes the buffer back.
+      ctx->bindResourceBuffer(RTXDI_REUSE_BINDING_RTXDI_RESERVOIR_INPUT_OUTPUT, rtOutput.m_rtxdiReservoirBuffer.slice(Resources::AccessType::Write));
       ctx->bindResourceView(RTXDI_REUSE_BINDING_LAST_GBUFFER_INPUT_OUTPUT, rtOutput.m_gbufferLast.view, nullptr);
 
       // Outputs
 
       ctx->bindResourceView(RTXDI_REUSE_BINDING_REPROJECTION_CONFIDENCE_OUTPUT, rtOutput.m_reprojectionConfidence.view, nullptr);
       ctx->bindResourceView(RTXDI_REUSE_BINDING_BSDF_FACTOR_OUTPUT, rtOutput.m_bsdfFactor.view, nullptr);
-      ctx->bindResourceView(RTXDI_REUSE_BINDING_TEMPORAL_POSITION_OUTPUT, rtOutput.m_primaryRtxdiTemporalPosition.view(Resources::AccessType::Write), nullptr);
+      ctx->bindResourceView(RTXDI_REUSE_BINDING_TEMPORAL_POSITION_OUTPUT,
+        rtOutput.m_primaryRtxdiTemporalPosition.empty()
+          ? nullptr
+          : rtOutput.m_primaryRtxdiTemporalPosition.view(Resources::AccessType::Write), nullptr);
 
       {
         ScopedGpuProfileZone(ctx, "RTXDI Initial Sampling");
         ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, getRtxdiInitialSamplingShader(usePortalShaderVariants));
-        ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
+        SparseRendering::dispatchCompactedConsumer(*ctx, rtOutput, workgroups);
       }
 
       {
         ScopedGpuProfileZone(ctx, "RTXDI Temporal Reuse");
         ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, getRtxdiTemporalReuseShader(usePortalShaderVariants));
-        ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
+        SparseRendering::dispatchCompactedConsumer(*ctx, rtOutput, workgroups);
       }
     }
 
@@ -481,7 +537,7 @@ namespace dxvk {
       ctx->bindResourceView(RTXDI_REUSE_BINDING_HIT_DISTANCE_INPUT, rtOutput.m_primaryHitDistance.view, nullptr);
       ctx->bindResourceView(RTXDI_REUSE_BINDING_ALBEDO_INPUT, rtOutput.m_primaryAlbedo.view, nullptr);
       ctx->bindResourceView(RTXDI_REUSE_BINDING_BASE_REFLECTIVITY_INPUT, rtOutput.m_primaryBaseReflectivity.view(Resources::AccessType::Read), nullptr);
-      ctx->bindResourceView(RTXDI_REUSE_BINDING_WORLD_POSITION_INPUT, rtOutput.getCurrentPrimaryWorldPositionWorldTriangleNormal().view(Resources::AccessType::Read), nullptr);
+      ctx->bindResourceView(RTXDI_REUSE_BINDING_WORLD_POSITION_INPUT, rtOutput.getCompactedPrimaryWorldPositionWorldTriangleNormal().view(Resources::AccessType::Read), nullptr);
       ctx->bindResourceView(RTXDI_REUSE_BINDING_PREV_WORLD_POSITION_INPUT, rtOutput.getPreviousPrimaryWorldPositionWorldTriangleNormal().view(Resources::AccessType::Read, rtOutput.getPreviousPrimaryWorldPositionWorldTriangleNormal().matchesWriteFrameIdx(frameIdx - 1)), nullptr);
       ctx->bindResourceView(RTXDI_REUSE_BINDING_WS_MVEC_INPUT, rtOutput.m_primaryVirtualMotionVector.view(Resources::AccessType::Read), nullptr);
       ctx->bindResourceView(RTXDI_REUSE_BINDING_SS_MVEC_INPUT, rtOutput.m_primaryScreenSpaceMotionVector.view, nullptr);
@@ -494,24 +550,47 @@ namespace dxvk {
       ctx->bindResourceView(RTXDI_REUSE_BINDING_SHARED_TERMINATOR_FIX_INPUT, rtOutput.getCurrentSharedTerminatorFix().view, nullptr);
       ctx->bindResourceView(RTXDI_REUSE_BINDING_SHARED_TERMINATOR_FIX_PREVIOUS_INPUT, rtOutput.getPreviousSharedTerminatorFix().view, nullptr);
       ctx->bindResourceView(RTXDI_REUSE_BINDING_SHARED_FLAGS_INPUT, rtOutput.m_sharedFlags.view, nullptr);
-      ctx->bindResourceView(RTXDI_REUSE_BINDING_ACTIVE_LOCAL_PIXEL_COORDS_INPUT, rtOutput.m_sparseRenderingActiveLocalPixelCoords.view, nullptr);
+      ctx->bindResourceView(RTXDI_REUSE_BINDING_COMPACTED_PIXEL_INDICES_INPUT, rtOutput.m_sparseRenderingCompactedPixelIndices.view, nullptr);
+      ctx->bindResourceView(RTXDI_REUSE_BINDING_TILE_ACTIVE_COUNTS_INPUT, rtOutput.m_sparseRenderingTileActiveCounts.view, nullptr);
+      ctx->bindResourceBuffer(RTXDI_REUSE_BINDING_ACTIVE_PIXEL_COORDS_INPUT, optionalBufferSlice(rtOutput.m_sparseRenderingActivePixelCoords));
+      ctx->bindResourceBuffer(RTXDI_REUSE_BINDING_ACTIVE_PIXEL_COUNT_INPUT, optionalBufferSlice(rtOutput.m_sparseRenderingActivePixelCount));
+
+      // Spatial reuse rebuilds inactive neighbors from these. See RAB_GetInactiveGBufferSurface.
+      const bool compactedGBuffer = rtOutput.m_raytraceArgs.sparseRenderingArgs.mode != SparseRenderingMode::Off;
+      ctx->bindResourceView(RTXDI_REUSE_BINDING_WORLD_POSITION_DENSE_INPUT, rtOutput.getCurrentPrimaryWorldPositionWorldTriangleNormal().view(Resources::AccessType::Read), nullptr);
+      ctx->bindResourceView(RTXDI_REUSE_BINDING_SHARED_FLAGS_DENSE_INPUT,
+        compactedGBuffer
+          ? rtOutput.m_sharedFlagsDense.view(Resources::AccessType::Read)
+          : nullptr, nullptr);
+      ctx->bindResourceView(RTXDI_REUSE_BINDING_LINEAR_VIEW_Z_INPUT, rtOutput.m_primaryLinearViewZ.view, nullptr);
+      ctx->bindResourceView(RTXDI_REUSE_BINDING_WORLD_SHADING_NORMAL_DENSE_INPUT,
+        compactedGBuffer
+          ? rtOutput.m_primaryWorldShadingNormalDense.view
+          : nullptr, nullptr);
+      ctx->bindResourceView(RTXDI_REUSE_BINDING_ALBEDO_DENSE_INPUT,
+        compactedGBuffer
+          ? rtOutput.m_primaryAlbedoDLSSRR.view
+          : nullptr, nullptr);
 
       // Inputs / Outputs
 
-      ctx->bindResourceBuffer(RTXDI_REUSE_BINDING_RTXDI_RESERVOIR_INPUT_OUTPUT, DxvkBufferSlice(rtOutput.m_rtxdiReservoirBuffer, 0, rtOutput.m_rtxdiReservoirBuffer->info().size));
+      ctx->bindResourceBuffer(RTXDI_REUSE_BINDING_RTXDI_RESERVOIR_INPUT_OUTPUT, rtOutput.m_rtxdiReservoirBuffer.slice(Resources::AccessType::ReadWrite));
       ctx->bindResourceView(RTXDI_REUSE_BINDING_LAST_GBUFFER_INPUT_OUTPUT, rtOutput.m_gbufferLast.view, nullptr);
 
       // Outputs
 
       ctx->bindResourceView(RTXDI_REUSE_BINDING_REPROJECTION_CONFIDENCE_OUTPUT, rtOutput.m_reprojectionConfidence.view, nullptr);
       ctx->bindResourceView(RTXDI_REUSE_BINDING_BSDF_FACTOR_OUTPUT, rtOutput.m_bsdfFactor.view, nullptr);
-      ctx->bindResourceView(RTXDI_REUSE_BINDING_TEMPORAL_POSITION_OUTPUT, rtOutput.m_primaryRtxdiTemporalPosition.view(Resources::AccessType::Write), nullptr);
+      ctx->bindResourceView(RTXDI_REUSE_BINDING_TEMPORAL_POSITION_OUTPUT,
+        rtOutput.m_primaryRtxdiTemporalPosition.empty()
+          ? nullptr
+          : rtOutput.m_primaryRtxdiTemporalPosition.view(Resources::AccessType::Write), nullptr);
       ctx->bindResourceView(RTXDI_REUSE_BINDING_BEST_LIGHTS_INPUT, rtOutput.m_rtxdiBestLights.view(Resources::AccessType::Read, rtOutput.m_raytraceArgs.enableRtxdiBestLightSampling), nullptr);
 
       ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, getRtxdiSpatialReuseShader(
         usePortalShaderVariants,
         useRtxdiSpatialBsdfDetailShaderVariant(rtOutput)));
-      ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
+      SparseRendering::dispatchCompactedConsumer(*ctx, rtOutput, workgroups);
     }
   }
 
@@ -541,20 +620,28 @@ namespace dxvk {
       
       // Inputs
 
-      ctx->bindResourceBuffer(RTXDI_COMPUTE_GRADIENTS_BINDING_RTXDI_RESERVOIR, DxvkBufferSlice(rtOutput.m_rtxdiReservoirBuffer, 0, rtOutput.m_rtxdiReservoirBuffer->info().size));
+      ctx->bindResourceBuffer(RTXDI_COMPUTE_GRADIENTS_BINDING_RTXDI_RESERVOIR, rtOutput.m_rtxdiReservoirBuffer.slice(Resources::AccessType::Read));
       ctx->bindResourceView(RTXDI_COMPUTE_GRADIENTS_BINDING_CURRENT_WORLD_POSITION_INPUT, rtOutput.getCurrentPrimaryWorldPositionWorldTriangleNormal().view(Resources::AccessType::Read), nullptr);
       ctx->bindResourceView(RTXDI_COMPUTE_GRADIENTS_BINDING_PREVIOUS_WORLD_POSITION_INPUT, rtOutput.getPreviousPrimaryWorldPositionWorldTriangleNormal().view(Resources::AccessType::Read, rtOutput.getPreviousPrimaryWorldPositionWorldTriangleNormal().matchesWriteFrameIdx(frameIdx - 1)), nullptr);
       ctx->bindResourceView(RTXDI_COMPUTE_GRADIENTS_BINDING_CONE_RADIUS_INPUT, rtOutput.m_primaryConeRadius.view, nullptr);
       ctx->bindResourceView(RTXDI_COMPUTE_GRADIENTS_BINDING_MVEC_INPUT, rtOutput.m_primaryVirtualMotionVector.view(Resources::AccessType::Read), nullptr);
       ctx->bindResourceView(RTXDI_COMPUTE_GRADIENTS_BINDING_POSITION_ERROR_INPUT, rtOutput.m_primaryPositionError.view, nullptr);
-      ctx->bindResourceView(RTXDI_COMPUTE_GRADIENTS_BINDING_TEMPORAL_POSITION_INPUT, rtOutput.m_primaryRtxdiTemporalPosition.view(Resources::AccessType::Read), nullptr);
+      ctx->bindResourceView(RTXDI_COMPUTE_GRADIENTS_BINDING_TEMPORAL_POSITION_INPUT,
+        rtOutput.m_primaryRtxdiTemporalPosition.empty()
+          ? nullptr
+          : rtOutput.m_primaryRtxdiTemporalPosition.view(Resources::AccessType::Read), nullptr);
       ctx->bindResourceView(RTXDI_COMPUTE_GRADIENTS_BINDING_CURRENT_ILLUMINANCE_INPUT, rtOutput.getCurrentRtxdiIlluminance().view(Resources::AccessType::Read), nullptr);
 
       const bool isPreviousIlluminanceValid = rtOutput.getPreviousRtxdiIlluminance().matchesWriteFrameIdx(frameIdx - 1);
       ctx->bindResourceView(RTXDI_COMPUTE_GRADIENTS_BINDING_PREVIOUS_ILLUMINANCE_INPUT, rtOutput.getPreviousRtxdiIlluminance().view(Resources::AccessType::Read, isPreviousIlluminanceValid), nullptr);
 
       ctx->bindResourceView(RTXDI_COMPUTE_GRADIENTS_BINDING_HIT_DISTANCE_INPUT, rtOutput.m_primaryHitDistance.view, nullptr);
-      ctx->bindResourceView(RTXDI_COMPUTE_GRADIENTS_BINDING_SHARED_FLAGS_INPUT, rtOutput.m_sharedFlags.view, nullptr);
+      // This pass reads flags at arbitrary pixels, which the compacted SharedFlags cannot serve.
+      const bool compactedGBuffer = rtOutput.m_raytraceArgs.sparseRenderingArgs.mode != SparseRenderingMode::Off;
+      ctx->bindResourceView(RTXDI_COMPUTE_GRADIENTS_BINDING_SHARED_FLAGS_INPUT,
+        compactedGBuffer
+          ? rtOutput.m_sharedFlagsDense.view(Resources::AccessType::Read)
+          : rtOutput.m_sharedFlags.view, nullptr);
 
       // Outputs
 

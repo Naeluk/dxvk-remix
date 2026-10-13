@@ -47,6 +47,14 @@ struct LightRange {
   uint32_t count;
 };
 
+// GPU layout of a single light identity table entry. Matches StructuredBuffer<uint2>
+// lightIdentities in the shaders: .x = runtime-stable light identity,
+// .y = current light-buffer index.
+struct LightIdentityGpuEntry {
+  uint32_t identity;
+  uint32_t index;
+};
+
 struct LightManager : public CommonDeviceObject {
 public:
   enum class FallbackLightMode : int {
@@ -75,6 +83,8 @@ public:
   const Rc<DxvkBuffer> getLightBuffer() const { return m_lightBuffer; }
   const Rc<DxvkBuffer> getPreviousLightBuffer() const { return m_previousLightBuffer.ptr() ? m_previousLightBuffer : m_lightBuffer; }
   const Rc<DxvkBuffer> getLightMappingBuffer() const { return m_lightMappingBuffer; }
+  const Rc<DxvkBuffer> getLightIdentityBuffer() const { return m_lightIdentityBuffer; }
+  bool isLightIdentityTableBuilt() const { return !m_lightIdentityData.empty(); }
   const uint32_t getActiveCount() const { return m_currentActiveLightCount; }
   const DomeLightArgs& getDomeLightArgs();
 
@@ -115,6 +125,8 @@ private:
   // order to be deterministic in tests.
   std::unordered_map<uint64_t, RtLight> m_externallyTrackedLights;
   uint64_t m_nextExternallyTrackedLightId = 0;
+  uint64_t m_nextLightIdentity = 1;
+  bool m_sparseRenderingEnabledLastUpdate = false;
   // Note: A fallback light tracked seperately and handled specially to not be mixed up with
   // lights provided from the application.
   std::optional<RtLight> m_fallbackLight{};
@@ -127,6 +139,7 @@ private:
   Rc<DxvkBuffer> m_lightBuffer;
   Rc<DxvkBuffer> m_previousLightBuffer;
   Rc<DxvkBuffer> m_lightMappingBuffer;
+  Rc<DxvkBuffer> m_lightIdentityBuffer;
 
   uint32_t m_currentActiveLightCount = 0;
   std::array<LightRange, lightTypeCount> m_lightTypeRanges;
@@ -137,6 +150,7 @@ private:
   std::vector<RtLight*> m_linearizedLights{};
   std::vector<unsigned char> m_lightsGPUData{};
   std::vector<uint16_t> m_lightMappingData{};
+  std::vector<LightIdentityGpuEntry> m_lightIdentityData{};
 
   // Mutex to prevent the debugging UI from accessing the light data after it's been deleted.
   mutable std::mutex m_lightUIMutex;
@@ -151,6 +165,7 @@ private:
   //  Returns 0~1 if similar, higher is more similar
   static float isSimilar(const RtLight& a, const RtLight& b, float distanceThreshold);
   static void updateLight(const RtLight& in, RtLight& out);
+  uint32_t allocateLightIdentity();
 
   RTX_OPTION("rtx", bool, suppressLightKeeping, false, 
              "If true, Remix doesn't keep game's original light sources for many frames. "
@@ -177,6 +192,8 @@ private:
   }
   RTX_OPTION_ARGS("rtx", FallbackLightType, fallbackLightType, FallbackLightType::Distant, "The light type to use for the fallback light. Determines which other fallback light options are used.", args.onChangeCallback = &fallbackLightOnChange);
   RTX_OPTION_ARGS("rtx", Vector3, fallbackLightRadiance, Vector3(1.6f, 1.8f, 2.0f), "The radiance to use for the fallback light (used across all light types).", args.minValue = Vector3(0.0f, 0.0f, 0.0f), args.onChangeCallback = &fallbackLightOnChange);
+  RTX_OPTION_ARGS("rtx", float, fallbackLightVolumetricRadianceScale, 1.0f, "The volumetric radiance scale to use for the fallback light (used across all light types). Scales the fallback light's contribution to volumetric lighting only, leaving its surface lighting unchanged. Set to 0 to remove the fallback light from volumetric lighting entirely.",
+                  args.onChangeCallback = &fallbackLightOnChange, args.minValue = 0.0f, args.maxValue = FLOAT16_MAX);
   RTX_OPTION_ARGS("rtx", Vector3, fallbackLightDirection, Vector3(-0.2f, -1.0f, 0.4f), "The direction to use for the fallback light (used only for Distant light types)", args.onChangeCallback = &fallbackLightOnChange);
   RTX_OPTION_ARGS("rtx", float, fallbackLightAngle, 5.0f, "The angular size in degrees to use for the fallback light (used only for Distant light types). Should only be within the range [0, 180].",
                   args.onChangeCallback = &fallbackLightOnChange, args.minValue = 0.0f);

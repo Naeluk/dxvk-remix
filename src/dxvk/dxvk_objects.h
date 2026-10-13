@@ -61,6 +61,7 @@
 #include "rtx_render/rtx_particle_system.h"
 #include "rtx_render/rtx_point_instancer_system.h"
 #include "rtx_render/rtx_gpu_crash.h"
+#include "rtx_render/rtx_dlss_neural_rendering.h"
 
 #include "rtx_render/rtx_denoise_type.h"
 #include "../util/util_lazy.h"
@@ -85,6 +86,7 @@ namespace dxvk {
   class RtxTextureManager;
   class NeuralRadianceCache;
   class DxvkXeSS;
+  class SpatiallyHashedRadianceCache;
   class SparseRendering;
 
   class NGXContext;
@@ -179,6 +181,10 @@ namespace dxvk {
       return m_neuralRadianceCache.get();
     }
 
+    SpatiallyHashedRadianceCache& metaSpatiallyHashedRadianceCache() {
+      return m_spatiallyHashedRadianceCache.get();
+    }
+
     DxvkDenoise& metaPrimaryDirectLightDenoiser() {
       return m_primaryDirectLightDenoiser.get();
     }
@@ -221,6 +227,10 @@ namespace dxvk {
 
     DxvkDLFG& metaDLFG() {
       return m_dlfg.get();
+    }
+
+    DlssNeuralRendering& metaDlssNeuralRendering() {
+      return m_dlssNeuralRendering.get();
     }
 
     DxvkNIS& metaNIS() {
@@ -380,6 +390,7 @@ namespace dxvk {
     Active<DemodulatePass>                  m_demodulate;
     Active<NeeCachePass>                    m_neeCache;
     Active<NeuralRadianceCache>             m_neuralRadianceCache;
+    Active<SpatiallyHashedRadianceCache>    m_spatiallyHashedRadianceCache;
     Active<DxvkDenoise>                     m_primaryDirectLightDenoiser;
     Active<DxvkDenoise>                     m_primaryIndirectLightDenoiser;
     Active<DxvkDenoise>                     m_primaryCombinedLightDenoiser;
@@ -392,6 +403,7 @@ namespace dxvk {
     Active<DxvkDenoise>                     m_referenceDenoiserSecondLobe2;
     Active<DxvkDLSS>                        m_dlss;
     Active<DxvkRayReconstruction>           m_rayReconstruction;
+    Active<DlssNeuralRendering>             m_dlssNeuralRendering;
     Active<DxvkNIS>                         m_nis;
     Active<DxvkTemporalAA>                  m_taa;
     Active<DxvkXeSS>                        m_xess;

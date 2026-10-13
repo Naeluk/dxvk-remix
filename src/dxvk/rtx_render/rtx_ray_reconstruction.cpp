@@ -55,10 +55,8 @@ namespace dxvk {
         BEGIN_PARAMETER()
         CONSTANT_BUFFER(RAY_RECONSTRUCTION_CONSTANTS_INPUT)
         // Primary surface data
-        TEXTURE2D(RAY_RECONSTRUCTION_PRIMARY_INDIRECT_SPECULAR_INPUT)
         TEXTURE2D(RAY_RECONSTRUCTION_PRIMARY_ATTENUATION_INPUT)
         TEXTURE2D(RAY_RECONSTRUCTION_PRIMARY_VIRTUAL_WORLD_SHADING_NORMAL_INPUT)
-        TEXTURE2D(RAY_RECONSTRUCTION_PRIMARY_CONE_RADIUS_INPUT)
         TEXTURE2D(RAY_RECONSTRUCTION_PRIMARY_DISOCCLUSION_MASK_INPUT)
         // Secondary surface data
         TEXTURE2D(RAY_RECONSTRUCTION_SECONDARY_ALBEDO_INPUT)
@@ -157,7 +155,23 @@ namespace dxvk {
     auto motionVectorInput = &rtOutput.m_primaryScreenSpaceMotionVectorDLSSRR;
     auto depthInput = &rtOutput.m_primaryDepthDLSSRR.resource(Resources::AccessType::Read);
     
-    {
+    // The compacted GBuffer's albedo sources are compacted, so DLSS-RR reads the dense copies instead.
+    const bool compactedGBuffer = rtOutput.m_raytraceArgs.sparseRenderingArgs.mode != SparseRenderingMode::Off;
+    const Resources::Resource& diffuseAlbedoGuide = compactedGBuffer
+      ? rtOutput.m_primaryAlbedoDLSSRR
+      : rtOutput.m_primaryAlbedo;
+    const Resources::Resource& specularAlbedoGuide = compactedGBuffer
+      ? rtOutput.m_primarySpecularAlbedoDLSSRR
+      : rtOutput.m_primarySpecularAlbedo.resource(Resources::AccessType::ReadWrite);
+
+    // The compacted GBuffer writes the guides in their final form,
+    // so this pass only has work for the disocclusion mask blur and debug views.
+    const bool preparePassHasWork =
+      rtOutput.m_raytraceArgs.sparseRenderingArgs.mode == SparseRenderingMode::Off ||
+      enableDisocclusionMaskBlur() ||
+      rtOutput.m_raytraceArgs.debugView != DEBUG_VIEW_DISABLED;
+
+    if (preparePassHasWork) {
       ScopedGpuProfileZone(ctx, "Prepare DLSS");
 
       RayReconstructionArgs constants = { };
@@ -173,6 +187,7 @@ namespace dxvk {
       constants.disocclusionMaskBlurRadius = disocclusionMaskBlurRadius();
       constants.rcpSquaredDisocclusionMaskBlurGaussianWeightSigma = 1.0f / (disocclusionMaskBlurNormalizedGaussianWeightSigma() * disocclusionMaskBlurNormalizedGaussianWeightSigma());
       constants.enableReSTIRGI = RtxOptions::useReSTIRGI();
+      constants.sparseRenderingArgs = rtOutput.m_raytraceArgs.sparseRenderingArgs;
 
       ctx->updateBuffer(m_constants, 0, sizeof(constants), &constants);
       ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_constants);
@@ -181,7 +196,6 @@ namespace dxvk {
 
       ctx->bindResourceBuffer(RAY_RECONSTRUCTION_CONSTANTS_INPUT, DxvkBufferSlice(m_constants, 0, m_constants->info().size));
 
-      ctx->bindResourceView(RAY_RECONSTRUCTION_PRIMARY_INDIRECT_SPECULAR_INPUT, rtOutput.m_primaryIndirectSpecularRadiance.view(Resources::AccessType::Read), nullptr);
       // Primary data
       ctx->bindResourceView(RAY_RECONSTRUCTION_PRIMARY_ATTENUATION_INPUT, rtOutput.m_primaryAttenuation.view, nullptr);
       ctx->bindResourceView(RAY_RECONSTRUCTION_PRIMARY_VIRTUAL_WORLD_SHADING_NORMAL_INPUT, rtOutput.m_primaryVirtualWorldShadingNormalPerceptualRoughness.view, nullptr);
@@ -192,7 +206,6 @@ namespace dxvk {
       ctx->bindResourceView(RAY_RECONSTRUCTION_SECONDARY_SPECULAR_ALBEDO_INPUT, rtOutput.m_secondarySpecularAlbedo.view(Resources::AccessType::Read), nullptr);
       ctx->bindResourceView(RAY_RECONSTRUCTION_SECONDARY_ATTENUATION_INPUT, rtOutput.m_secondaryAttenuation.view, nullptr);
       ctx->bindResourceView(RAY_RECONSTRUCTION_SECONDARY_VIRTUAL_WORLD_SHADING_NORMAL_INPUT, rtOutput.m_secondaryVirtualWorldShadingNormalPerceptualRoughness.view, nullptr);
-      ctx->bindResourceView(RAY_RECONSTRUCTION_PRIMARY_CONE_RADIUS_INPUT, rtOutput.m_primaryConeRadius.view, nullptr);
 
       ctx->bindResourceView(RAY_RECONSTRUCTION_SHARED_FLAGS_INPUT, rtOutput.m_sharedFlags.view, nullptr);
       // DLSSRR data
@@ -204,14 +217,18 @@ namespace dxvk {
 
       // Inputs/Outputs
 
-      ctx->bindResourceView(RAY_RECONSTRUCTION_PRIMARY_ALBEDO_INPUT_OUTPUT, rtOutput.m_primaryAlbedo.view, nullptr);
-      ctx->bindResourceView(RAY_RECONSTRUCTION_PRIMARY_SPECULAR_ALBEDO_INPUT_OUTPUT,
-        rtOutput.m_primarySpecularAlbedo.view(Resources::AccessType::ReadWrite), nullptr);
+      ctx->bindResourceView(RAY_RECONSTRUCTION_PRIMARY_ALBEDO_INPUT_OUTPUT, diffuseAlbedoGuide.view, nullptr);
+      ctx->bindResourceView(RAY_RECONSTRUCTION_PRIMARY_SPECULAR_ALBEDO_INPUT_OUTPUT, specularAlbedoGuide.view, nullptr);
 
       // Outputs
 
       ctx->bindResourceView(RAY_RECONSTRUCTION_DEBUG_VIEW_OUTPUT, debugView.getDebugOutput(), nullptr);
-      ctx->bindResourceView(RAY_RECONSTRUCTION_PRIMARY_DISOCCLUSION_MASK_OUTPUT, rtOutput.m_primaryDisocclusionMaskForRR.view(Resources::AccessType::Write), nullptr);
+      // The disocclusion mask is left out when Ray Reconstruction will not read it.
+      // See Resources::needsDisocclusionMaskForRR.
+      const Rc<DxvkImageView> disocclusionMaskOutput = rtOutput.m_primaryDisocclusionMaskForRR.empty()
+        ? nullptr
+        : rtOutput.m_primaryDisocclusionMaskForRR.view(Resources::AccessType::Write);
+      ctx->bindResourceView(RAY_RECONSTRUCTION_PRIMARY_DISOCCLUSION_MASK_OUTPUT, disocclusionMaskOutput, nullptr);
 
       ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, PrepareRayReconstructionShader::getShader());
 
@@ -231,23 +248,14 @@ namespace dxvk {
         rtOutput.m_compositeOutput.view(Resources::AccessType::Read),
         motionVectorInput->view,
         depthInput->view,
-        rtOutput.m_primaryVirtualWorldShadingNormalPerceptualRoughness.view,
-        rtOutput.getCurrentPrimaryWorldPositionWorldTriangleNormal().view(Resources::AccessType::Read),
-        rtOutput.m_primaryAlbedo.view,
-        rtOutput.m_sharedBiasCurrentColorMask.view(Resources::AccessType::Read),
+        diffuseAlbedoGuide.view,
         rtOutput.m_primaryWorldShadingNormalDLSSRR.view(Resources::AccessType::Read),
-        rtOutput.m_primarySpecularAlbedo.view(Resources::AccessType::Read),
+        specularAlbedoGuide.view,
         rtOutput.m_primaryPerceptualRoughness.view,
         rtOutput.m_rayReconstructionHitDistance.view(Resources::AccessType::Read)
       };
 
-      const DxvkAutoExposure& autoExposure = device()->getCommon()->metaAutoExposure();
-      if (!mAutoExposure) {
-        pInputs.push_back(autoExposure.getExposureTexture().view);
-      }
-
       std::vector<Rc<DxvkImageView>> pOutputs = {
-        rtOutput.m_sharedBiasCurrentColorMask.view(Resources::AccessType::Write),
         rtOutput.m_finalOutput.view(Resources::AccessType::Write)
       };
 
@@ -294,7 +302,7 @@ namespace dxvk {
       // technical sense but this is likely what they mean).
       auto normalsInput = &rtOutput.m_primaryWorldShadingNormalDLSSRR.resource(Resources::AccessType::Read);
       // Note: Texture contains specular albedo in this case as DLSS happens after demodulation
-      auto specularAlbedoInput = &rtOutput.m_primarySpecularAlbedo.resource(Resources::AccessType::Read);
+      auto specularAlbedoInput = &specularAlbedoGuide;
       m_rayReconstructionContext->setWorldToViewMatrix(camera.getWorldToView());
       m_rayReconstructionContext->setViewToProjectionMatrix(camera.getViewToProjection());
 
@@ -304,13 +312,10 @@ namespace dxvk {
       buffers.pResolvedColor = &rtOutput.m_finalOutput.resource(Resources::AccessType::Write);
       buffers.pMotionVectors = motionVectorInput;
       buffers.pDepth = depthInput;
-      buffers.pDiffuseAlbedo = &rtOutput.m_primaryAlbedo;
+      buffers.pDiffuseAlbedo = &diffuseAlbedoGuide;
       buffers.pSpecularAlbedo = specularAlbedoInput;
-      buffers.pExposure = &autoExposure.getExposureTexture();
-      buffers.pPosition = &rtOutput.getCurrentPrimaryWorldPositionWorldTriangleNormal().resource(Resources::AccessType::Read);
       buffers.pNormals = normalsInput;
       buffers.pRoughness = &rtOutput.m_primaryPerceptualRoughness;
-      buffers.pBiasCurrentColorMask = &rtOutput.m_sharedBiasCurrentColorMask.resource(Resources::AccessType::Read);
       buffers.pHitDistance = useSpecularHitDistance() ? &rtOutput.m_rayReconstructionHitDistance.resource(Resources::AccessType::Read) : nullptr;
       buffers.pDisocclusionMask = enableDisocclusionMaskBlur()
         ? &rtOutput.m_primaryDisocclusionMaskForRR.resource(Resources::AccessType::Read)
@@ -318,13 +323,11 @@ namespace dxvk {
 
       NGXRayReconstructionContext::NGXSettings settings;
       settings.resetAccumulation = resetHistory;
-      settings.antiGhost = m_biasCurrentColorEnabled;
       settings.preExposure = mPreExposure;
       settings.jitterOffset[0] = jitterOffset[0];
       settings.jitterOffset[1] = jitterOffset[1];
       settings.motionVectorScale[0] = motionVectorScale[0];
       settings.motionVectorScale[1] = motionVectorScale[1];
-      settings.autoExposure = mAutoExposure;
       settings.frameTimeMilliseconds = frameTimeMilliseconds;
 
       m_rayReconstructionContext->evaluateRayReconstruction(ctx, buffers, settings);
@@ -348,8 +351,6 @@ namespace dxvk {
   }
 
   void DxvkRayReconstruction::showRayReconstructionImguiSettings(bool showAdvancedSettings) {
-    RemixGui::Checkbox("Anti-Ghost", &m_biasCurrentColorEnabled);
-
     if (showAdvancedSettings) {
       bool presetChanged = RemixGui::Combo("DLSS-RR Preset", &pathTracerPresetObject(), "Default\0ReSTIR Finetuned\0");
       if (presetChanged) {

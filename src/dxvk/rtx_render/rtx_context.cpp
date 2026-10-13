@@ -36,6 +36,7 @@
 #include "rtx_terrain_baker.h"
 #include "rtx_texture_manager.h"
 #include "rtx_neural_radiance_cache.h"
+#include "rtx_spatially_hashed_radiance_cache.h"
 #include "rtx_ray_reconstruction.h"
 #include "rtx_xess.h"
 #include "rtx_rtxdi_rayquery.h"
@@ -196,7 +197,7 @@ namespace dxvk {
 
     checkOpacityMicromapSupport();
     checkShaderExecutionReorderingSupport();
-    checkNeuralRadianceCacheSupport();
+    checkIndirectLightingSupport();
     reportCpuSimdSupport();
 
     GlobalTime::get().init(RtxOptions::timeDeltaBetweenFrames() * 0.001f);
@@ -287,11 +288,14 @@ namespace dxvk {
     // Calculate extents based on if DLSS is enabled or not
     const VkExtent3D downscaleExtent = setDownscaleExtent(upscaleExtent);
 
-    // Resize the RT screen dependant buffers (if needed)
+    // Resize the RT screen dependent buffers (if needed)
     getResourceManager().onResize(this, downscaleExtent, upscaleExtent);
 
     uint32_t renderSize[] = { downscaleExtent.width, downscaleExtent.height };
     uint32_t displaySize[] = { upscaleExtent.width, upscaleExtent.height };
+
+    DlssNeuralRendering& dlssnr = m_common->metaDlssNeuralRendering();
+    dlssnr.setDlssNeuralRenderingSettings(displaySize);
 
     // Set resolution to cameras for jittering
     for (int i = 0; i < CameraType::Count; i++) {
@@ -400,17 +404,19 @@ namespace dxvk {
     const RtCamera& mainCamera = getSceneManager().getCamera();
     m_resetHistory = m_resetHistory || mainCamera.isViewHistoryInvalidated(m_device->getCurrentFrameId());
 
+    checkIndirectLightingSupport();
+
+    // Force history reset on integrate indirect mode change to discard incompatible history
+    if (RtxOptions::integrateIndirectMode() != m_prevIntegrateIndirectMode) {
+      m_resetHistory = true;
+      m_prevIntegrateIndirectMode = RtxOptions::integrateIndirectMode();
+    }
+
     // Call onFrameBegin callbacks for RtxPases
     // Note: this needs to be called after resetScreenResolution() call in a frame
     // since an RtxPass may alias some of its resources with the ones created in createRaytracingOutput()
     getResourceManager().onFrameBegin(this, getCommonObjects()->getTextureManager(), getSceneManager(), downscaledExtent,
                                       upscaledExtent, m_resetHistory, mainCamera.isCameraCut());
-
-    // Force history reset on integrate indirect mode change to discard incompatible history 
-    if (RtxOptions::integrateIndirectMode() != m_prevIntegrateIndirectMode) {
-      m_resetHistory = true;
-      m_prevIntegrateIndirectMode = RtxOptions::integrateIndirectMode();
-    }
 
     if (RtxOptions::integrateIndirectMode() == IntegrateIndirectMode::NeuralRadianceCache &&
         m_common->metaNeuralRadianceCache().isResettingHistory()) {
@@ -441,6 +447,7 @@ namespace dxvk {
       Resources::RaytracingOutput& rtOutput = getResourceManager().getRaytracingOutput();
 
       m_common->metaNeuralRadianceCache().onFrameEnd(rtOutput);
+      m_common->metaSpatiallyHashedRadianceCache().onFrameEnd(rtOutput);
       rtOutput.onFrameEnd();
     }
 
@@ -649,7 +656,8 @@ namespace dxvk {
 
         Resources::RaytracingOutput& rtOutput = getResourceManager().getRaytracingOutput();
 
-        if (common->metaNGXContext().supportsDLFG()) {
+        // The queues hold a single entry unless frame generation runs, see Resources::createDlfgResourceQueues.
+        if (rtOutput.m_primaryDepthQueue[1].isValid()) {
           rtOutput.m_primaryDepthQueue.next();
           rtOutput.m_primaryScreenSpaceMotionVectorQueue.next();
         }
@@ -745,12 +753,14 @@ namespace dxvk {
         RtxDustParticles& dust = m_common->metaDustParticles();
         dust.simulateAndDraw(this, m_state, rtOutput);
 
+        const bool dlssNrEnabled = dispatchDlssNR(rtOutput);
+
         dispatchBloom(rtOutput);
 
         // Motion blur runs before tonemapping while the image is still in linear HDR space.
         dispatchPostFxMotionBlur(rtOutput);
 
-        dispatchToneMapping(rtOutput);
+        dispatchToneMapping(rtOutput, !dlssNrEnabled);
 
         // Lens effects (chromatic aberration, vignette) run AFTER tonemapping. They are
         // display-space artifacts so they operate on post-tonemap LDR data.
@@ -829,7 +839,7 @@ namespace dxvk {
     RtxOptionManager::applyPendingValues(m_device.ptr(), /* forceOnChange */ false);
 
     // Update stats
-    updateMetrics(gpuIdleTimeMilliseconds);
+    updateMetrics(gpuIdleTimeMilliseconds, raytracedThisFrame);
 
     m_resetHistory = false;
   }
@@ -894,10 +904,37 @@ namespace dxvk {
     GpuMemoryTracker::onFrameEnd();
   }
 
-  void RtxContext::updateMetrics(const float gpuIdleTimeMilliseconds) const {
+  void RtxContext::updateMetrics(const float gpuIdleTimeMilliseconds, const bool raytracedThisFrame) {
     ScopedCpuProfileZone();
-    Metrics::logRollingAverage(Metric::dxvk_average_frame_time_ms, GlobalTime::get().realDeltaTimeMs()); // In milliseconds
-    Metrics::logRollingAverage(Metric::dxvk_gpu_idle_time_ms, gpuIdleTimeMilliseconds); // In milliseconds
+    const uint32_t frameId = m_device->getCurrentFrameId();
+    if (raytracedThisFrame && m_firstRaytracedFrameId == kInvalidFrameIndex) {
+      m_firstRaytracedFrameId = frameId;
+    }
+
+    // injectRTX can run twice in a frame with an invalid camera, so sample once per frame. GPU idle time from a repeat call carries into the next sample.
+    m_metricsGpuIdleTimeMs += gpuIdleTimeMilliseconds;
+    if (m_lastMetricsFrameId == frameId) {
+      return;
+    }
+    m_lastMetricsFrameId = frameId;
+    const float frameGpuIdleTimeMs = m_metricsGpuIdleTimeMs;
+    m_metricsGpuIdleTimeMs = 0.0f;
+
+    const float timeSinceStartMs = static_cast<float>(GlobalTime::get().realTimeSinceStartMs());
+    Metrics::logFloat(Metric::dxvk_total_time_ms, timeSinceStartMs);
+    Metrics::logFloat(Metric::dxvk_frame_count, static_cast<float>(frameId));
+
+    // Samples taken here measure the previous frame, so warmup ends one frame later than the frame count suggests.
+    const uint32_t warmupFrames = RtxOptions::Automation::metricsWarmupFrames();
+    const bool isWarmup = warmupFrames > 0 &&
+                          (m_firstRaytracedFrameId == kInvalidFrameIndex || frameId <= m_firstRaytracedFrameId + warmupFrames);
+    if (isWarmup) {
+      Metrics::logFloat(Metric::dxvk_warmup_time_ms, timeSinceStartMs);
+      return;
+    }
+
+    Metrics::logAverage(Metric::dxvk_average_frame_time_ms, GlobalTime::get().realDeltaTimeMs()); // In milliseconds
+    Metrics::logAverage(Metric::dxvk_gpu_idle_time_ms, frameGpuIdleTimeMs); // In milliseconds
     uint64_t vidUsageMib = 0;
     uint64_t sysUsageMib = 0;
     const VkPhysicalDeviceMemoryProperties memprops = m_device->adapter()->memoryProperties();
@@ -912,10 +949,8 @@ namespace dxvk {
         sysUsageMib += m_device->getMemoryStats(i).totalUsed() >> 20;
       }
     }
-    Metrics::logRollingAverage(Metric::dxvk_vid_memory_usage_mb, static_cast<float>(vidUsageMib)); // In MB
-    Metrics::logRollingAverage(Metric::dxvk_sys_memory_usage_mb, static_cast<float>(sysUsageMib)); // In MB
-    Metrics::logFloat(Metric::dxvk_total_time_ms, static_cast<float>(GlobalTime::get().realTimeSinceStartMs()));
-    Metrics::logFloat(Metric::dxvk_frame_count, static_cast<float>(m_device->getCurrentFrameId()));
+    Metrics::logAverage(Metric::dxvk_vid_memory_usage_mb, static_cast<float>(vidUsageMib)); // In MB
+    Metrics::logAverage(Metric::dxvk_sys_memory_usage_mb, static_cast<float>(sysUsageMib)); // In MB
   }
 
   void RtxContext::setConstantBuffers(const uint32_t vsFixedFunctionConstants, const uint32_t psSharedStateConstants, Rc<DxvkBuffer> vertexCaptureCB) {
@@ -1081,6 +1116,7 @@ namespace dxvk {
 
     constants.fireflyFilteringLuminanceThreshold = RtxOptions::fireflyFilteringLuminanceThreshold();
     constants.secondarySpecularFireflyFilteringThreshold = RtxOptions::secondarySpecularFireflyFilteringThreshold();
+    constants.primaryIndirectSpecularFireflyFilteringThreshold = RtxOptions::primaryIndirectSpecularFireflyFilteringThreshold();
     constants.primaryRayMaxInteractions = RtxOptions::primaryRayMaxInteractions();
     constants.psrRayMaxInteractions = RtxOptions::psrRayMaxInteractions();
     constants.secondaryRayMaxInteractions = RtxOptions::secondaryRayMaxInteractions();
@@ -1271,7 +1307,6 @@ namespace dxvk {
     constants.enableReSTIRGIDiscardEnlargedPixels = restirGI.useDiscardEnlargedPixels();
     constants.reSTIRGIHistoryDiscardStrength = restirGI.historyDiscardStrength();
     constants.enableReSTIRGITemporalJacobian = restirGI.useTemporalJacobian();
-    constants.reSTIRGIFireflyThreshold = restirGI.fireflyThreshold();
     constants.reSTIRGIRoughnessClamp = restirGI.roughnessClamp();
     constants.reSTIRGIMISRoughness = restirGI.misRoughness();
     constants.reSTIRGIMISParallaxAmount = restirGI.parallaxAmount();
@@ -1281,11 +1316,19 @@ namespace dxvk {
     constants.enableReSTIRGIVisibilityValidation = restirGI.validateVisibilityChange();
     constants.reSTIRGIVisibilityValidationRange = 1.0f + restirGI.visibilityValidationRange();
 
+    constants.rtxdiGradientResourcesAllocated = getResourceManager().areRtxdiGradientResourcesAllocated();
+    constants.rtxdiIlluminanceAllocated = getResourceManager().areRtxdiIlluminanceResourcesAllocated();
+
     // Neural Radiance Cache
     NeuralRadianceCache& nrc = m_common->metaNeuralRadianceCache();
     constants.enableNrc = nrc.isActive();
     constants.allowNrcTraining = NeuralRadianceCache::NrcOptions::trainCache();
     nrc.setRaytraceArgs(constants);
+
+    // Spatially Hashed Radiance Cache
+    SpatiallyHashedRadianceCache& sharc = m_common->metaSpatiallyHashedRadianceCache();
+    constants.enableSharc = sharc.isActive();
+    sharc.setRaytraceArgs(*this, constants);
 
     m_common->metaNeeCache().setRaytraceArgs(constants, m_resetHistory);
     constants.surfaceCount = getSceneManager().getAccelManager().getSurfaceCount();
@@ -1311,7 +1354,13 @@ namespace dxvk {
       constants.debugView = debugView.debugViewIdx();
       constants.debugKnob = debugView.debugKnob();
       constants.forceFirstHitInGBufferPass = debugView.showFirstGBufferHit();
-      
+      constants.enableDlssNrControlMask =
+        m_common->metaDlssNeuralRendering().useDlssNeuralRendering() &&
+        !DlssNeuralRendering::useAutoMask();
+      constants.enableDlssNrVolumetricControlMask =
+        constants.enableDlssNrControlMask &&
+        DlssNeuralRendering::enableVolumetricControlMask();
+
       constants.gpuPrintThreadIndex = u16vec2 { kInvalidThreadIndex, kInvalidThreadIndex };
       constants.gpuPrintElementIndex = frameIdx % kMaxFramesInFlight;
 
@@ -1464,6 +1513,7 @@ namespace dxvk {
     Rc<DxvkBuffer> lightBuffer = getSceneManager().getLightManager().getLightBuffer();
     Rc<DxvkBuffer> previousLightBuffer = getSceneManager().getLightManager().getPreviousLightBuffer();
     Rc<DxvkBuffer> lightMappingBuffer = getSceneManager().getLightManager().getLightMappingBuffer();
+    Rc<DxvkBuffer> lightIdentityBuffer = getSceneManager().getLightManager().getLightIdentityBuffer();
     Rc<DxvkBuffer> gpuPrintBuffer = getResourceManager().getRaytracingOutput().m_gpuPrintBuffer;
     Rc<DxvkImageView> valueNoiseLut = getResourceManager().getValueNoiseLut(this);
     Rc<DxvkSampler> linearSampler = getResourceManager().getSampler(VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_REPEAT);
@@ -1483,6 +1533,7 @@ namespace dxvk {
     bindResourceBuffer(BINDING_LIGHT_DATA_BUFFER, DxvkBufferSlice(lightBuffer, 0, lightBuffer.ptr() ? lightBuffer->info().size : 0));
     bindResourceBuffer(BINDING_PREVIOUS_LIGHT_DATA_BUFFER, DxvkBufferSlice(previousLightBuffer, 0, previousLightBuffer.ptr() ? previousLightBuffer->info().size : 0));
     bindResourceBuffer(BINDING_LIGHT_MAPPING, DxvkBufferSlice(lightMappingBuffer, 0, lightMappingBuffer.ptr() ? lightMappingBuffer->info().size : 0));
+    bindResourceBuffer(BINDING_LIGHT_IDENTITY_BUFFER, lightIdentityBuffer.ptr() ? DxvkBufferSlice(lightIdentityBuffer, 0, lightIdentityBuffer->info().size) : DxvkBufferSlice());
     bindResourceBuffer(BINDING_BILLBOARDS_BUFFER, DxvkBufferSlice(billboardsBuffer, 0, billboardsBuffer.ptr() ? billboardsBuffer->info().size : 0));
     bindResourceView(BINDING_BLUE_NOISE_TEXTURE, getResourceManager().getBlueNoiseTexture(this), nullptr);
     bindResourceBuffer(BINDING_CONSTANTS, DxvkBufferSlice(constantsBuffer, 0, constantsBuffer->info().size));
@@ -1540,16 +1591,26 @@ namespace dxvk {
     Logger::info(str::format("[RTX info] Shader Execution Reordering: ", isShaderExecutionReorderingEnabled ? "enabled" : "disabled"));
   }
 
-  void RtxContext::checkNeuralRadianceCacheSupport() {
-    // Update RtxOption selection if Neural Radiance Cache was selected but it's not supported
-    if (RtxOptions::integrateIndirectMode() == IntegrateIndirectMode::NeuralRadianceCache &&
+  void RtxContext::checkIndirectLightingSupport() {
+    const IntegrateIndirectMode integrateMode = RtxOptions::integrateIndirectMode();
+    const bool sharcSupported = SpatiallyHashedRadianceCache::checkIsSupported(m_device.ptr());
+
+    if (static_cast<uint32_t>(integrateMode) >= static_cast<uint32_t>(IntegrateIndirectMode::Count)) {
+      Logger::warn("[RTX] Unsupported indirect illumination mode selected. Switching to a supported mode.");
+      RtxOptions::integrateIndirectMode.setImmediately(sharcSupported ? IntegrateIndirectMode::SHaRC : IntegrateIndirectMode::ReSTIRGI, RtxOptionLayer::getQualityLayer());
+      return;
+    }
+
+    if (integrateMode == IntegrateIndirectMode::NeuralRadianceCache &&
         !NeuralRadianceCache::checkIsSupported(m_device.ptr())) {
 
-      // Fallback to ReSTIRGI
-      Logger::warn(str::format("[RTX] Neural Radiance Cache is not supported. Switching indirect illumination mode to ReSTIR GI."));
+      Logger::warn("[RTX] Neural Radiance Cache is not supported. Switching indirect illumination mode to ReSTIR GI.");
       // TODO[REMIX-4105] trying to use NRC for a frame when it isn't supported will cause a crash, so this needs to be setImmediately.
       // Should refactor this to use a separate global for the final state, and indicate user preference with the option.
       // Use Quality layer to ensure this overrides the Environment layer (where env vars are stored).
+      RtxOptions::integrateIndirectMode.setImmediately(IntegrateIndirectMode::ReSTIRGI, RtxOptionLayer::getQualityLayer());
+    } else if (integrateMode == IntegrateIndirectMode::SHaRC && !sharcSupported) {
+      Logger::warn("[RTX] SHaRC requires shaderInt64 and shaderBufferInt64Atomics. Switching to ReSTIR GI.");
       RtxOptions::integrateIndirectMode.setImmediately(IntegrateIndirectMode::ReSTIRGI, RtxOptionLayer::getQualityLayer());
     }
   }
@@ -1576,9 +1637,36 @@ namespace dxvk {
     // Integrate indirect
     {
       ScopedGpuProfileZone(this, "Integrate Indirect Raytracing");
-      setFramePassStage(RtxFramePassStage::IndirectIntegration);
-      
-      m_common->metaPathtracerIntegrateIndirect().dispatch(this, rtOutput);
+
+      SpatiallyHashedRadianceCache& sharc = m_common->metaSpatiallyHashedRadianceCache();
+      const bool isSharcUpdateCombinedWithQuery = sharc.isUpdateCombinedWithQuery();
+
+      // SHaRC Update passes
+      if (RtxOptions::integrateIndirectMode() == IntegrateIndirectMode::SHaRC && !isSharcUpdateCombinedWithQuery) {
+        // Indirect PT - SHaRC Update pass
+        if (SpatiallyHashedRadianceCache::SharcOptions::enableUpdate())
+        {
+          ScopedGpuProfileZone(this, "Indirect (SHaRC Update)");
+          setFramePassStage(RtxFramePassStage::IndirectIntegrationUpdate);
+
+          const bool doSharcUpdate = true;
+          m_common->metaPathtracerIntegrateIndirect().dispatch(this, rtOutput, doSharcUpdate);
+        }
+
+        sharc.dispatch(*this, rtOutput);
+      }
+
+      // Indirect PT
+      {
+        setFramePassStage(RtxFramePassStage::IndirectIntegration);
+
+        m_common->metaPathtracerIntegrateIndirect().dispatch(this, rtOutput);
+      }
+
+      // The resolve needs the combined dispatch's update samples, so the dispatch's queries read the previous frame's cache.
+      if (isSharcUpdateCombinedWithQuery) {
+        sharc.dispatch(*this, rtOutput);
+      }
     }
 
     // Integrate indirect - NEE Cache pass
@@ -1587,12 +1675,12 @@ namespace dxvk {
 
   void RtxContext::dispatchPathTracing(const Resources::RaytracingOutput& rtOutput) {
 
+    // Sparse Rendering: sampling rates + active-pixel mask + compaction.
+    // Runs before the Gbuffer, which stores active pixels at their compacted coordinates.
+    m_common->metaSparseRendering().dispatch(*this, rtOutput);
+
     // Gbuffer Raytracing
     m_common->metaPathtracerGbuffer().dispatch(this, rtOutput);
-
-    // Sparse Rendering: sampling rates + active-pixel mask + compaction.
-    // Runs after Gbuffer so the active-pixel mask can read current-frame SharedFlags.
-    m_common->metaSparseRendering().dispatch(*this, rtOutput);
 
     // RTXDI
     m_common->metaRtxdiRayQuery().dispatch(this, rtOutput);
@@ -1805,7 +1893,40 @@ namespace dxvk {
       rtOutput, settings);
   }
 
-  void RtxContext::dispatchToneMapping(const Resources::RaytracingOutput& rtOutput) {
+  bool RtxContext::dispatchDlssNR(const Resources::RaytracingOutput& rtOutput) {
+    ScopedCpuProfileZone();
+
+    auto& dlssNr = m_common->metaDlssNeuralRendering();
+    if (!dlssNr.useDlssNeuralRendering()) {
+      return false;
+    }
+
+    DxvkToneMapping& toneMapper = m_common->metaToneMapping();
+    DxvkAutoExposure& autoExposure = m_common->metaAutoExposure();
+    autoExposure.dispatch(this,
+      getResourceManager().getSampler(VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER),
+      rtOutput, GlobalTime::get().deltaTimeMs());
+
+    // DLSS-NR operates in SDR space; inverse tone mapping restores HDR for downstream post-processing.
+    toneMapper.dispatchFastToneMapping(
+      this,
+      autoExposure.getExposureTexture().view,
+      rtOutput,
+      autoExposure.enabled());
+
+    const bool useRayReconstructionGuides = m_currentUpscaler == InternalUpscaler::DLSS_RR;
+    if (dlssNr.dispatch(this, m_execBarriers, rtOutput, m_resetHistory, useRayReconstructionGuides)) {
+      toneMapper.dispatchInverseToneMapping(
+        this,
+        autoExposure.getExposureTexture().view,
+        rtOutput,
+        autoExposure.enabled());
+    }
+
+    return true;
+  }
+
+  void RtxContext::dispatchToneMapping(const Resources::RaytracingOutput& rtOutput, bool updateAutoExposure) {
     ScopedCpuProfileZone();
 
     if (m_common->metaDebugView().debugViewIdx() == DEBUG_VIEW_PRE_TONEMAP_OUTPUT) {
@@ -1817,9 +1938,11 @@ namespace dxvk {
     this->unbindComputePipeline();
 
     DxvkAutoExposure& autoExposure = m_common->metaAutoExposure();
-    autoExposure.dispatch(this,
-      getResourceManager().getSampler(VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER),
-      rtOutput, GlobalTime::get().deltaTimeMs());
+    if (updateAutoExposure) {
+      autoExposure.dispatch(this,
+        getResourceManager().getSampler(VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER),
+        rtOutput, GlobalTime::get().deltaTimeMs());
+    }
 
     const bool resetToneMapperHistory = m_resetHistory || getSceneManager().getCamera().isCameraCut();
     setFramePassStage(RtxFramePassStage::ToneMapping);

@@ -72,8 +72,9 @@ namespace dxvk {
         SAMPLER3D(COMPOSITE_VOLUME_FILTERED_RADIANCE_Y_INPUT)
         SAMPLER3D(COMPOSITE_VOLUME_FILTERED_RADIANCE_CO_CG_INPUT)
         TEXTURE2D(COMPOSITE_ALPHA_GBUFFER_INPUT)
-        TEXTURE2D(COMPOSITE_ACTIVE_PIXEL_MASK_INPUT)
-        TEXTURE2D(COMPOSITE_ACTIVE_LOCAL_PIXEL_COORDS_INPUT)
+        TEXTURE2D(COMPOSITE_COMPACTED_PIXEL_INDICES_INPUT)
+        TEXTURE2D(COMPOSITE_TILE_ACTIVE_COUNTS_INPUT)
+        TEXTURE2D(COMPOSITE_PIXEL_SAMPLING_RATE_INPUT)
         TEXTURE2DARRAY(COMPOSITE_BLUE_NOISE_TEXTURE)
         SAMPLER3D(COMPOSITE_VALUE_NOISE_SAMPLER)
 
@@ -119,6 +120,8 @@ namespace dxvk {
         TEXTURE2D(COMPOSITE_ALPHA_GBUFFER_INPUT)
         TEXTURE2D(COMPOSITE_ACTIVE_PIXEL_MASK_INPUT)
         TEXTURE2D(COMPOSITE_ACTIVE_LOCAL_PIXEL_COORDS_INPUT)
+        TEXTURE2D(COMPOSITE_TILE_ACTIVE_COUNTS_INPUT)
+        TEXTURE2D(COMPOSITE_PRIMARY_SURFACE_FLAGS_INPUT)
         TEXTURE2DARRAY(COMPOSITE_BLUE_NOISE_TEXTURE)
         SAMPLER3D(COMPOSITE_VALUE_NOISE_SAMPLER)
         SAMPLER2D(COMPOSITE_SKY_LIGHT_TEXTURE)
@@ -131,6 +134,7 @@ namespace dxvk {
         RW_TEXTURE2D(COMPOSITE_ALPHA_BLEND_RADIANCE_OUTPUT)
         RW_TEXTURE2D(COMPOSITE_DEBUG_VIEW_OUTPUT)
         RW_TEXTURE2D(COMPOSITE_RAY_RECONSTRUCTION_HIT_DISTANCE_OUTPUT)
+        RW_TEXTURE2D(COMPOSITE_DLSS_NR_CONTROL_MASK_OUTPUT)
       END_PARAMETER()
     };
 
@@ -346,6 +350,9 @@ namespace dxvk {
     ctx->bindResourceView(COMPOSITE_ALPHA_GBUFFER_INPUT, rtOutput.m_alphaBlendGBuffer.view, nullptr);
     ctx->bindResourceView(COMPOSITE_ACTIVE_PIXEL_MASK_INPUT, rtOutput.m_sparseRenderingActivePixelMask.view, nullptr);
     ctx->bindResourceView(COMPOSITE_ACTIVE_LOCAL_PIXEL_COORDS_INPUT, rtOutput.m_sparseRenderingActiveLocalPixelCoords.view, nullptr);
+    ctx->bindResourceView(COMPOSITE_COMPACTED_PIXEL_INDICES_INPUT, rtOutput.m_sparseRenderingCompactedPixelIndices.view, nullptr);
+    ctx->bindResourceView(COMPOSITE_TILE_ACTIVE_COUNTS_INPUT, rtOutput.m_sparseRenderingTileActiveCounts.view, nullptr);
+    ctx->bindResourceView(COMPOSITE_PRIMARY_SURFACE_FLAGS_INPUT, rtOutput.m_primarySurfaceFlags.view, nullptr);
 
     // Note: Clamp to edge used to avoid interpolation to black on the edges of the view.
     Rc<DxvkSampler> linearSampler = ctx->getResourceManager().getSampler(VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
@@ -377,6 +384,7 @@ namespace dxvk {
     ctx->bindResourceView(COMPOSITE_DEBUG_VIEW_OUTPUT, debugView.getDebugOutput(), nullptr);
     ctx->bindResourceView(COMPOSITE_RAY_RECONSTRUCTION_HIT_DISTANCE_OUTPUT,
       ctx->useRayReconstruction() ? rtOutput.m_rayReconstructionHitDistance.view(Resources::AccessType::Write) : nullptr, nullptr);
+    ctx->bindResourceView(COMPOSITE_DLSS_NR_CONTROL_MASK_OUTPUT, rtOutput.m_controlMask.view, nullptr);
     const DomeLightArgs& domeLightArgs = sceneManager.getLightManager().getDomeLightArgs();
     ctx->bindResourceSampler(COMPOSITE_SKY_LIGHT_TEXTURE, linearSampler);
     if (domeLightArgs.active && domeLightArgs.textureIndex != BINDING_INDEX_INVALID) {
@@ -428,6 +436,7 @@ namespace dxvk {
     compositeArgs.useRayReconstruction = ctx->useRayReconstruction();
     compositeArgs.enhanceAlbedo = ctx->useRayReconstruction() && rayReconstruction.enableDetailEnhancement();
     compositeArgs.writeRayReconstructionHitDistance = ctx->useRayReconstruction() ? 1u : 0u;
+    compositeArgs.enableDlssNrVolumetricControlMask = rtOutput.m_raytraceArgs.enableDlssNrVolumetricControlMask;
 
     NrdArgs primaryDirectNrdArgs;
     NrdArgs primaryIndirectNrdArgs;

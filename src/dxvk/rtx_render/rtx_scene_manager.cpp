@@ -834,6 +834,12 @@ namespace dxvk {
     replacementInstance->categoryFlags = input.getCategoryFlags().raw();
     replacementInstance->isSkinned = input.getSkinningState().numBones > 0;
 
+    // On the first submission of a new frame, refresh the cached source buffer from this draw. Only
+    // the first submission updates it, so the identity is deterministic (the first pass's buffer).
+    if (!secondSubmissionThisFrame) {
+      replacementInstance->sourceVertexBufferAddress = input.getGeometryData().sourceVertexBufferAddress;
+    }
+
     // Cache this submission's texture-coordinate projection so that next frame's
     // computeDirtyFlags can detect drift. Writing here (after either path has run)
     // mirrors how objectToWorld is updated downstream of the dirty-flag check.
@@ -1837,7 +1843,11 @@ namespace dxvk {
         roughnessConstant, metallicConstant,
         emissiveColorConstant, enableEmissive,
         ignoreAlphaChannel, thinFilmEnable, alphaIsThinFilmThickness,
-        thinFilmThicknessConstant, samplerIndex, displaceIn, displaceOut, 
+        thinFilmThicknessConstant, samplerIndex, displaceIn, displaceOut,
+        opaqueMaterialData.getEnableDLSSControlMask(),
+        opaqueMaterialData.getDLSSControlMaskIntensity(),
+        opaqueMaterialData.getDLSSControlMaskToneStrength(),
+        opaqueMaterialData.getDLSSControlMaskStructuralStrength(),
         subsurfaceMaterialIndex, isUsingRaytracedRenderTarget, isHairCard,
         samplerFeedbackStamp,
         secondaryTextureIndex
@@ -2188,6 +2198,10 @@ namespace dxvk {
     m_lightManager.dynamicLightMatching();
 
     garbageCollection();
+
+    // Correct instance identification within clusters of interchangeable
+    // instances now that every draw call for the frame has been submitted.
+    m_drawCallTracker.repairClusteredInstanceHistory(m_device->getCurrentFrameId());
 
     // Re-register buffers, textures, and materials for anti-culled instances.
     // These instances survived GC but the game didn't submit draw calls for them
@@ -2603,11 +2617,33 @@ namespace dxvk {
     }
   }
 
-  void SceneManager::destroyExternalMesh(remixapi_MeshHandle handle) {
-    if (handle) {
-      m_drawCallTracker.removeReplacementInstancesWithSpatialMapHash(
-          spatialMapHashForExternalDrawMesh(handle));
-      m_pReplacer->destroyExternalMesh(handle);
+  // Set from remixapi_dxvk_CreateD3D9() when the client is an editor/DCC host (HdRemix).
+  bool g_remixApiEditorModeEnabled = false;
+
+  void SceneManager::destroyExternalMesh(const Rc<DxvkContext>& ctx, remixapi_MeshHandle handle) {
+    if (!handle) {
+      return;
+    }
+
+    m_drawCallTracker.removeReplacementInstancesWithSpatialMapHash(
+        spatialMapHashForExternalDrawMesh(handle));
+    m_pReplacer->destroyExternalMesh(handle);
+
+    // An API-driven client (HdRemix) stops presenting the moment its scene becomes empty, so
+    // injectRTX() - and with it garbageCollection(), the sceneKeepAliveFrames-based clear() and
+    // onFrameEnd()/manageTextureVram() - never runs again, and the DXVK frame id stops advancing.
+    // The whole scene would stay committed and the next scene would be allocated on top of it
+    // (DXVK memory is a high water mark), leaking a full scene worth of VRAM per open/close
+    // cycle. The last DestroyMesh is the authoritative teardown signal and it already runs on the
+    // dxvk-cs thread with a live context, so do the teardown here.
+    if (ctx.ptr() != nullptr &&
+        g_remixApiEditorModeEnabled &&
+        RtxOptions::clearSceneOnLastExternalMeshDestroyed() &&
+        !m_pReplacer->hasExternalMeshes()) {
+      clear(ctx, /* needWfi = */ true);
+      // DXVK doesnt free chunks for us by default (its high water mark), so hand the geometry,
+      // BLAS, OMM and buffer-cache memory freed above back to the system.
+      m_device->getCommon()->memoryManager().freeUnusedChunks();
     }
   }
 

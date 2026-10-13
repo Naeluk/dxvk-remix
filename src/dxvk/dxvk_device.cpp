@@ -26,6 +26,7 @@
 #include "rtx_render/rtx_ray_reconstruction.h"
 #include "rtx_render/rtx_texture_manager.h"
 #include "rtx_render/rtx_neural_radiance_cache.h"
+#include "rtx_render/rtx_spatially_hashed_radiance_cache.h"
 #include "rtx_render/rtx_rtxdi_rayquery.h"
 #include "rtx_render/rtx_restir_gi_rayquery.h"
 #include "rtx_render/rtx_composite.h"
@@ -542,6 +543,7 @@ namespace dxvk {
     m_demodulate(device),
     m_neeCache(device),
     m_neuralRadianceCache(device),
+    m_spatiallyHashedRadianceCache(device),
     m_primaryDirectLightDenoiser(device, DenoiserType::DirectLight),
     m_primaryIndirectLightDenoiser(device, DenoiserType::IndirectLight),
     m_primaryCombinedLightDenoiser(device, DenoiserType::DirectAndIndirectLight),
@@ -553,6 +555,7 @@ namespace dxvk {
     m_referenceDenoiserSecondLobe2(device, DenoiserType::Reference),
     m_dlss(device),
     m_rayReconstruction(device),
+    m_dlssNeuralRendering(device),
     m_nis(device),
     m_taa(device),
     m_xess(device),
@@ -588,6 +591,7 @@ namespace dxvk {
     m_referenceDenoiserSecondLobe1.get().onDestroy();
     m_referenceDenoiserSecondLobe2.get().onDestroy();
     m_rayReconstruction.get().onDestroy();
+    m_dlssNeuralRendering.get().onDestroy();
     m_dlss.get().onDestroy();
     m_dlfg.get().onDestroy();
     // NV-DXVK start: Shut down NGX after releasing its features

@@ -41,6 +41,9 @@
 #include "rtx_pathtracer_integrate_direct.h"
 #include "rtx_pathtracer_integrate_indirect.h"
 #include "rtx_dlss.h"
+#include "rtx_gpu_overrides.h"
+#include "rtx_gpu_profile.h"
+#include "rtx_graphics_preset.h"
 #include "rtx_materials.h"
 #include "rtx/pass/material_args.h"
 #include "rtx_option.h"
@@ -70,17 +73,6 @@ namespace dxvk {
     NIS,
     TAAU,
     XeSS
-  };
-
-  enum class GraphicsPreset : int {
-    Ultra = 0,
-    High,
-    Medium,
-    Low,
-    Custom,
-    // Note: Used to automatically have the graphics preset set on initialization, not used beyond this case
-    // as it should be overridden by one of the other values by the time any other code uses it.
-    Auto
   };
 
   enum class RaytraceModePreset {
@@ -170,6 +162,7 @@ namespace dxvk {
     ImportanceSampled = 0,   // Importance sampled integration - provides the noisiest output and used primarily for reference comparisons
     ReSTIRGI = 1,            // Importance Sampled + ReSTIR GI integrations
     NeuralRadianceCache = 2, // Implements a live trained neural network to provide a world space radiance cache and allow the pathtracer to terminate paths earlier into the cache.
+    SHaRC = 3,               // Implements a Spatially Hashed Radiance Cache (SHaRC) to provide a world space radiance cache and allow the pathtracer to terminate paths earlier into the cache.        
   
     Count
   };
@@ -345,6 +338,8 @@ namespace dxvk {
                     args.minValue = 0.0f);
     RTX_OPTION_ARGS("rtx", float, fireflyFilteringLuminanceThreshold, 1000.0f, "Maximum luminance threshold for the firefly filtering to clamp to.",
                     args.minValue = 0.0f);
+    RTX_OPTION_ARGS("rtx", float, primaryIndirectSpecularFireflyFilteringThreshold, 50.0f, "Maximum per-channel radiance for the primary indirect specular signal to suppress fireflies.",
+                    args.minValue = 0.0f);
     RTX_OPTION("rtx", float, secondarySpecularFireflyFilteringThreshold, 1000.0f, "Firefly luminance clamping threshold for secondary specular signal.");
     RTX_OPTION_ARGS("rtx", float, vertexColorStrength, 0.6f,
                     "A scalar to apply to how strong vertex color influence should be on materials.\n"
@@ -518,16 +513,16 @@ namespace dxvk {
     RTX_OPTION_ENV("rtx", bool, useRTXDI, true, "DXVK_USE_RTXDI",
                    "A flag indicating if RTXDI should be used, true enables RTXDI, false disables it and falls back on simpler light sampling methods.\n"
                    "RTXDI provides improved direct light sampling quality over traditional methods and should generally be enabled for improved direct lighting quality at the cost of some performance.");
-    RTX_OPTION_ARGS("rtx", IntegrateIndirectMode, integrateIndirectMode, IntegrateIndirectMode::NeuralRadianceCache,
+    RTX_OPTION_ARGS("rtx", IntegrateIndirectMode, integrateIndirectMode, IntegrateIndirectMode::SHaRC,
                    "Indirect integration mode:\n"
                    "0: Importance Sampled. Importance sampled mode uses typical GI sampling and it is not recommended for general use as it provides the noisiest output.\n"
                    "   It serves as a reference integration mode for validation of other indirect integration modes.\n"
                    "1: ReSTIR GI. ReSTIR GI provides improved indirect path sampling over \"Importance Sampled\" mode \n"
                    "   with better indirect diffuse and specular GI quality at increased performance cost.\n"
                    "2: RTX Neural Radiance Cache (NRC). NRC is an AI based world space radiance cache. It is live trained by the path tracer\n"
-                   "   and allows paths to terminate early by looking up the cached value and saving performance.\n"
-                   "   NRC supports infinite bounces and often provides results closer to that of reference than ReSTIR GI\n"
-                   "   while improving performance in scenarios where ray paths have 2 or more bounces on average.\n",
+                   "   and remains available as an alternative cache path.\n"
+                   "3: Spatially Hashed Radiance Cache (SHaRC). SHaRC is the default world-space radiance cache. It uses a spatial hash\n"
+                   "   to store radiance and allows paths to terminate early by looking up cached values.\n",
                    args.environment = "RTX_INTEGRATE_INDIRECT_MODE",
                    args.flags = RtxOptionFlags::UserSetting);
     RTX_OPTION_ARGS("rtx", UpscalerType, upscalerType, UpscalerType::DLSS, "Upscaling boosts performance with varying degrees of image quality tradeoff depending on the type of upscaler and the quality mode/preset.",
@@ -550,6 +545,14 @@ namespace dxvk {
     RTX_OPTION_ARGS("rtx", float, uniqueObjectDistance, 300.f, "The distance (in game units) that an object can move in a single frame before it is no longer considered the same object.\n"
                     "If this is too low, fast moving objects may flicker and have bad lighting.  If it's too high, repeated objects may flicker.\n"
                     "This does not account for sceneScale.", args.minValue = 0.f);
+
+    // Bounds the end-of-frame instance history repair, which scales cubically with cluster size.
+    RTX_OPTION_ARGS("rtx", uint32_t, maxInstanceHistoryRepairClusterSize, 1, "The largest cluster of interchangeable instances that end-of-frame instance history repair will process.\n"
+                   "Clusters above this size keep their as-submitted history, which may reintroduce draw-order-dependent identity swaps. Set to 0 to disable the repair pass entirely.", args.minValue = 0u);
+
+    // Restricts instance history repair to clusters whose count from its earlier count. Usually the clusters that have altered its size are the ones that are mismatched.
+    RTX_OPTION("rtx", bool, repairInstanceMatchOnlyWhenClusterChanges, true,
+               "Only run end-of-frame instance history repair on clusters whose instance count differs from its earlier count.\n");
 
     RTX_OPTION("rtx", bool, useNewGuiInputMethod, true, "Disables the previous method for getting mouse/keyboard input and enables a new method which should be more reliable.  If successful the old method will be deprecated.  This setting can't be changed at runtime, so it must be set in a .conf file.");
 
@@ -646,10 +649,15 @@ namespace dxvk {
     RTX_OPTION("rtx", uint32_t, numFramesToKeepInstances, 1, "");
     RTX_OPTION("rtx", uint32_t, numFramesToKeepBLAS, 1, "");
     RTX_OPTION("rtx", uint32_t, numFramesToKeepLights, 100, ""); // NOTE: This was the default we've had for a while, can probably be reduced...
-    RTX_OPTION("rtx", uint32_t, sceneKeepAliveFrames, 0, 
+    RTX_OPTION("rtx", uint32_t, sceneKeepAliveFrames, 0,
                "Number of consecutive frames without valid camera or raytracing before clearing the scene."
                " Set to 0 to clear immediately (legacy behavior). Higher values prevent scene clearing during"
                " brief shader loading delays, camera cuts, etc.");
+    RTX_OPTION("rtx", bool, clearSceneOnLastExternalMeshDestroyed, true,
+               "When the last mesh created through the Remix API is destroyed, immediately clear the scene and"
+               " release unused DXVK memory chunks, instead of waiting for frames that an API client (e.g. HdRemix)"
+               " may never submit once its scene is empty. Only applies to editor-mode (API-driven) sessions."
+               " Set to false to restore the purely frame-driven behavior.");
 
     static uint32_t numFramesToKeepGeometryData() {
       return numFramesToKeepBLAS();
@@ -1297,11 +1305,11 @@ namespace dxvk {
       RTX_OPTION("rtx.eye", bool, assumeViewTexgenModeAsEye, true,
                  "Used to detect eyes and its vectors, by assuming that a draw call with D3DTSS_TCI_CAMERASPACEPOSITION and specific texture transform is an eye draw call.");
       RTX_OPTION("rtx.eye", float, eyeballSphereOffset, 0.18F,
-                 "How much to offset a sphere origin when calculating the eye normals on Whites. "
+                 "Radius of the sphere used to calculate eye normals on the whites, in world units. "
                  "The larger the value, the more pronounced the ambient shadowing is on an eyeball, to better ground the eyes on a face.");
       RTX_OPTION("rtx.eye", float, corneaSphereOffset, 0.1F,
-                 "How much to offset a sphere origin when calculating the eye normals on Cornea. "
-                 "Positive values make the eye cornea appear more spherical. Negative values - more flat.");
+                 "Radius of the sphere used to calculate eye normals on the cornea, in world units. "
+                 "Larger values make the eye cornea appear more spherical.");
       RTX_OPTION("rtx.eye", float, eyeWhitesAlbedoScale, 0.5F, "Brightness multiplier for the eye whites.");
       RTX_OPTION("rtx.eye", float, irisRadius, 0.165F,
                  "Size of an iris in the iris texture. "
@@ -1329,6 +1337,9 @@ namespace dxvk {
       RTX_OPTION_FLAG_ENV("rtx.automation", bool, enableTestTrace, false, RtxOptionFlags::NoSave, "RTX_TEST_TRACE",
                           "Enables opt-in frame trace artifacts for automation-driven image tests.\n"
                           "When enabled, Remix records a bounded frame window around the configured screenshot frame, writes frame_trace.jsonl, and appends dxvk_trace_* summary fields to metrics.txt.");
+      RTX_OPTION_FLAG_ENV("rtx.automation", uint32_t, metricsWarmupFrames, 5, RtxOptionFlags::NoSave, "RTX_AUTOMATION_METRICS_WARMUP_FRAMES",
+                          "Number of frames, starting with the first ray traced frame, excluded as warmup from the averaged frame time, GPU idle time and memory usage in metrics.txt.\n"
+                          "Frames before the first ray traced frame are also excluded. 0 disables warmup, so every frame is averaged, including in runs that never ray trace. dxvk_warmup_time_ms reports the dxvk_total_time_ms clock at the last warmup sample.");
     };
 
   public:
@@ -1377,6 +1388,9 @@ namespace dxvk {
       if (env::getEnvVar("DXVK_DOCUMENTATION_WRITE_RTX_OPTIONS_MD") == "1") {
         RtxOptionManager::writeMarkdownDocumentation("RtxOptions.md");
       }
+
+      // Registered before layers load so their keys are created as the layers are applied.
+      GpuOverrides::registerNamespaces();
 
       // Initialize all system layers (creates layers from config files)
       RtxOptionLayer::initializeSystemLayers();

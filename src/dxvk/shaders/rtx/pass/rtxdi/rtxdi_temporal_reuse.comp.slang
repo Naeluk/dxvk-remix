@@ -51,81 +51,21 @@
 #include "rtx/algorithm/rtxdi/rtxdi.slangh"
 #include "rtx/pass/sparse_rendering/compact_active_pixels.slangh"
 
-// Cheap reprojection for inactive sparse rendering pixels.
-// Copies the previous frame's reservoir forward (with light index remapping)
-// and decays confidence so that the pixel doesn't cause a false disocclusion boost
-// when it becomes active again.
-void reprojectInactivePixelReservoir(int2 pixelCoordinate) {
-  vec2 screenSpaceMotion = PrimaryScreenSpaceMotionVector[pixelCoordinate];
-  ivec2 prevPixelCenter = pixelCoordinate + ivec2(screenSpaceMotion.xy);
-
-  RTXDI_Reservoir reservoir = RTXDI_EmptyReservoir();
-  float confidence = 0;
-
-  if (all(prevPixelCenter >= 0) && all(prevPixelCenter < cb.camera.resolution)) {
-    RAB_Surface currentSurface = RAB_GetGBufferSurface(pixelCoordinate, false);
-    RAB_Surface previousSurface = RAB_GetGBufferSurface(prevPixelCenter, true);
-
-    if (RAB_IsSurfaceValid(currentSurface) && RAB_IsSurfaceValid(previousSurface)) {
-      // Surface consistency check with thresholds matching RTXDI spatial reuse conventions
-      if (RTXDI_IsValidNeighbor(
-            RAB_GetSurfaceNormal(currentSurface), RAB_GetSurfaceNormal(previousSurface),
-            RAB_GetSurfaceLinearDepth(currentSurface), RAB_GetSurfaceLinearDepth(previousSurface),
-            0.8, 0.1)) {
-        reservoir = RAB_LoadReservoir(prevPixelCenter, RTXDI_GetTemporalInputPage());
-
-        if (RTXDI_IsValidReservoir(reservoir)) {
-          uint16_t remappedLightIdx = RAB_TranslateLightIndex(reservoir.lightIdx, false);
-          if (remappedLightIdx == RTXDI_INVALID_LIGHT_INDEX) {
-            reservoir = RTXDI_EmptyReservoir();
-          } else {
-            reservoir.lightIdx = remappedLightIdx;
-            // Clamp M to 1 so this stale reservoir doesn't dominate during RIS
-            // combination in spatial reuse (risWeight = targetPdf * W * M).
-            // Without this, M accumulates across inactive frames and the stale
-            // inverse-PDF weight (W) can produce extreme fireflies.
-            reservoir.M = 1;
-          }
-        }
-      }
-
-      confidence = ReprojectionConfidence[prevPixelCenter];
-    }
-  }
-
-  // Decay confidence — inactive pixels gradually lose confidence so they don't
-  // cause a false disocclusion boost when they become active again
-  confidence = max(confidence - 1.0 / kReprojectionConfidenceHistoryLength, 0);
-
-  ReprojectionConfidence[pixelCoordinate] = confidence;
-  TemporalPosition[pixelCoordinate] = pack32(u16vec2(-1));
-  RAB_StoreReservoir(reservoir, pixelCoordinate, RTXDI_GetTemporalOutputPage());
-}
-
 [shader("compute")]
-[numthreads(16, 8, 1)]
-void main(int2 threadIndex : SV_DispatchThreadID)
+[numthreads(COMPACT_ACTIVE_PIXELS_CONSUMER_GROUP_SIZE_X, COMPACT_ACTIVE_PIXELS_CONSUMER_GROUP_SIZE_Y, 1)]
+void main(uint2 dispatchThreadId : SV_DispatchThreadID, uint3 groupId : SV_GroupID, uint groupIndex : SV_GroupIndex)
 {
-  if (any(threadIndex >= cb.camera.resolution))
+  uint2 threadIndex;
+  uvec2 compactedCoordinate;
+  if (!loadCompactedCoordinate(dispatchThreadId, groupId.x, groupIndex, ActivePixelCount,
+                              cb.camera.resolution, cb.sparseRenderingArgs, threadIndex, compactedCoordinate))
   {
     return;
   }
 
-  uvec2 remapped;
-  const bool isActive = loadPixelCoordinate(uint2(threadIndex), ActiveLocalPixelCoords,
-    cb.camera.resolution, cb.sparseRenderingArgs, remapped);
-  int2 pixelCoordinate = int2(remapped);
+  int2 pixelCoordinate = int2(loadLaunchPixelCoordinate(threadIndex, ActivePixelCoords, cb.sparseRenderingArgs));
 
-  if (!isActive)
-  {
-    if (cb.sparseRenderingArgs.enableRtxdiReuseForInactivePixels)
-    {
-      reprojectInactivePixelReservoir(pixelCoordinate);
-    }
-    return;
-  }
-
-  RAB_Surface surface = RAB_GetGBufferSurface(pixelCoordinate, false);
+  RAB_Surface surface = RAB_GetGBufferSurface(pixelCoordinate, false, int2(compactedCoordinate));
   if (!RAB_IsSurfaceValid(surface))
   {
     return;
@@ -163,7 +103,7 @@ void main(int2 threadIndex : SV_DispatchThreadID)
     RAB_SkipRandoms(rng, 1);
   }
 
-  const float3 virtualMotionVector = PrimaryVirtualMotionVector[pixelCoordinate].xyz;
+  const float3 virtualMotionVector = PrimaryVirtualMotionVector[compactedCoordinate].xyz;
   const float3 prevVirtualWorldPosition = surface.virtualWorldPosition + virtualMotionVector;
 
   float viewDirectionDotGeometryNormal = abs(dot(surface.minimalRayInteraction.viewDirection, surface.minimalSurfaceInteraction.geometryNormal));
@@ -206,11 +146,15 @@ void main(int2 threadIndex : SV_DispatchThreadID)
 
   // Remember which pixel the temporal reservoir belongs to, if it comes from a valid reprojection.
   // Needed for the gradients pass.
-  if (!isGBufferSimilar)
+  if (cb.rtxdiGradientResourcesAllocated)
   {
-    temporalSamplePixelPos = -1;
+    if (!isGBufferSimilar)
+    {
+      temporalSamplePixelPos = -1;
+    }
+
+    TemporalPosition[pixelCoordinate] = pack32(u16vec2(temporalSamplePixelPos));
   }
-  TemporalPosition[pixelCoordinate] = pack32(u16vec2(temporalSamplePixelPos));
 
   RAB_StoreReservoir(state, pixelCoordinate, RTXDI_GetTemporalOutputPage());
 }

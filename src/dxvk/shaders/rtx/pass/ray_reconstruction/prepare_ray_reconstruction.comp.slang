@@ -31,9 +31,6 @@
 layout(binding = RAY_RECONSTRUCTION_CONSTANTS_INPUT)
 ConstantBuffer<RayReconstructionArgs> cb;
 
-layout(rgba16f, binding = RAY_RECONSTRUCTION_PRIMARY_INDIRECT_SPECULAR_INPUT)
-Texture2D<float4> PrimaryIndirectSpecular;
-
 layout(binding = RAY_RECONSTRUCTION_PRIMARY_ATTENUATION_INPUT)
 Texture2D<uint> PrimaryAttenuation;
 
@@ -67,9 +64,6 @@ Texture2D<float2> InMotionVector;
 // Color fed into DLSS-RR (composite output); used for the input-color debug view.
 layout(binding = RAY_RECONSTRUCTION_INPUT_COLOR_INPUT)
 Texture2D<float4> InputColor;
-
-layout(r16f, binding = RAY_RECONSTRUCTION_PRIMARY_CONE_RADIUS_INPUT)
-Texture2D<float> PrimaryConeRadius;
 
 layout(r16f, binding = RAY_RECONSTRUCTION_PRIMARY_DISOCCLUSION_MASK_INPUT)
 Texture2D<float> DisocclusionMask;
@@ -211,9 +205,14 @@ void writeDebugViewOutputs(uint2 pixelCoordinate)
     bool isValid = true;
 
     // DEBUG_VIEW_RAY_RECONSTRUCTION_PRIMARY_DISOCCLUSION_MASK
-    isValid &= cb.enableDisocclusionMaskBlur
-      ? isValidValue(DisocclusionMaskOutput[pixelCoordinate])
-      : isValidValue(DisocclusionMask[pixelCoordinate]);
+    if (cb.enableDisocclusionMaskBlur)
+    {
+      isValid &= isValidValue(DisocclusionMaskOutput[pixelCoordinate]);
+    }
+    else
+    {
+      isValid &= isValidValue(DisocclusionMask[pixelCoordinate]);
+    }
 
     // DEBUG_VIEW_RAY_RECONSTRUCTION_DIFFUSE_ALBEDO
     isValid &= isValidValue(PrimaryAlbedo[pixelCoordinate]);
@@ -246,7 +245,11 @@ void preprocessInputsForRR(uint2 pixelCoordinate)
     bool hasSecondarySurface = geometryFlags.hasSecondarySurface();
 
     vec4 primaryAttenuation = vec4(r11g11b10ToColor(PrimaryAttenuation[pixelCoordinate]), 1.0);
-    vec4 secondaryAttenuation = hasSecondarySurface ? vec4(r11g11b10ToColor(SecondaryAttenuation[pixelCoordinate]), 1.0) : vec4(0,0,0,1);
+    vec4 secondaryAttenuation = vec4(0, 0, 0, 1);
+    if (hasSecondarySurface)
+    {
+      secondaryAttenuation = vec4(r11g11b10ToColor(SecondaryAttenuation[pixelCoordinate]), 1.0);
+    }
 
     // Normalize attenuation to get the color tinting without any dimmming
     const float maxPrimaryAttenuation = max3(primaryAttenuation.r, primaryAttenuation.g, primaryAttenuation.b);
@@ -284,8 +287,6 @@ void preprocessInputsForRR(uint2 pixelCoordinate)
 
     PrimarySpecularAlbedo[pixelCoordinate] = primarySpecularAlbedo;
   }
-
-  blurDisocclusionMask(pixelCoordinate);
 }
 
 [shader("compute")]
@@ -300,7 +301,14 @@ void main(uint2 threadId : SV_DispatchThreadID)
 
   uvec2 pixelCoordinate = threadId;
 
-  preprocessInputsForRR(pixelCoordinate);
+  // With sparse rendering on, the GBuffer writes the albedo guides instead, zeroing near-black albedo the same way.
+  if (cb.sparseRenderingArgs.mode == SparseRenderingMode::Off)
+  {
+    preprocessInputsForRR(pixelCoordinate);
+  }
+
+  // Reads only the dense disocclusion threshold mix, which every GBuffer pass writes.
+  blurDisocclusionMask(pixelCoordinate);
 
   writeDebugViewOutputs(pixelCoordinate);
 }

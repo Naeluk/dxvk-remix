@@ -43,16 +43,14 @@ current_build_dir_norm = meson.current_build_dir().replace('\\', '/')
 #     early outs if everything's already fetched, so the waste is negligible + forgiveable.
 get_dependencies_script_path = join_paths(global_src_root_norm, 'scripts-common/update-deps.cmd')
 message('Downloading dependencies...')
-# Note: arm64 deps placed in a separate xml to keep x64 builds functional
-dependencies_file = target_machine.cpu() != 'armv8' ? 'packman-external.xml' : 'packman-external-arm64.xml'
-packman_out = run_command(get_dependencies_script_path, dependencies_file, 'update-deps.log', check: true)
+packman_out = run_command(get_dependencies_script_path, 'packman-external.xml', 'update-deps.log', check: true)
 message(packman_out.stdout().strip())
 if packman_out.returncode() != 0
   message(packman_out.stderr().strip())
   error('Failed to get dependencies.')
 endif
 fetch_packman_target = custom_target('fetch_packman',
-  input            : [dependencies_file, get_dependencies_script_path],
+  input            : ['packman-external.xml', get_dependencies_script_path],
   output           : 'update-deps.log',
   command          : [get_dependencies_script_path, '@INPUT0@', '@OUTPUT0@' ] )
 
@@ -75,6 +73,7 @@ dxvk_is_msvc = dxvk_compiler.get_id() == 'msvc'
 dxvk_is_ninja = meson.backend() == 'ninja'
 dxvk_is_woa = target_machine.cpu() == 'armv8'
 dxvk_is_woa_ec = target_machine.cpu() == 'arm64ec'
+dxvk_is_x64 = not dxvk_is_woa and not dxvk_is_woa_ec
 enable_rtxio = get_option('enable_rtxio')
 
 external_dll_paths = []
@@ -104,6 +103,12 @@ if dxvk_is_msvc
     add_global_link_arguments('/OPT:REF', language : 'cpp')
     add_global_link_arguments('/OPT:ICF', language : 'cpp')
   endif
+endif
+
+# Passed per target because global link arguments do not always reach the VS backend targets (e.g. d3d9, HdRemix).
+dxvk_release_link_args = []
+if dxvk_is_msvc and dxvk_is_woa_ec and get_option('buildtype') == 'release'
+  dxvk_release_link_args = ['/DEBUG', '/OPT:REF', '/OPT:ICF']
 endif
 
 if enable_rtxio == true
@@ -193,7 +198,6 @@ if not dxvk_is_msvc
 endif
 
 remix_api_include_path = include_directories('./public/include')
-add_global_arguments('/DREMIX_LIBRARY_EXPORTS=1', language : 'cpp')
 
 if dxvk_is_woa
   nrc_include_path = 'external/nrc_arm64/include'
@@ -621,7 +625,8 @@ if enable_tests
   subdir('tests')
 endif
 
-hdremix_outdir = join_paths(meson.current_source_dir(), 'nv-private', 'hdremix', 'bin', get_option('buildtype'))
+hdremix_arch_outdir = dxvk_is_woa_ec ? 'bin_a64ec' : 'bin'
+hdremix_outdir = join_paths(meson.current_source_dir(), 'nv-private', 'hdremix', hdremix_arch_outdir, get_option('buildtype'))
 
 # dict of "output" targets --- key is an output path, value is an optional executable inside that path,
 # which is used to run that "output" from the IDE
@@ -815,7 +820,7 @@ if dxvk_is_ninja or dxvk_is_woa_ec
     if t != '_output'
       meson.add_install_script(
         join_paths(global_src_root_norm, 'scripts-common/install_file_in_dir.bat'),
-        join_paths(current_build_dir_norm, 'src/d3d9', 'd3d9.dll'), output_path,
+        join_paths(current_build_dir_norm, 'src/d3d9', 'd3d9*.dll'), output_path,
         install_tag: target_suffix
       )
     endif
@@ -824,7 +829,7 @@ if dxvk_is_ninja or dxvk_is_woa_ec
 	  # ensure we copy everything to these special targets, the PDB is important!
       meson.add_install_script(
         join_paths(global_src_root_norm, 'scripts-common/install_file_in_dir.bat'),
-        join_paths(current_build_dir_norm, 'src/d3d9', 'd3d9.*'), output_path,
+        join_paths(current_build_dir_norm, 'src/d3d9', 'd3d9*.*'), output_path,
         install_tag: target_suffix
       )
     endif

@@ -42,7 +42,11 @@
 #define RAB_HAS_CURRENT_GBUFFER 1
 #define SHADOW_TERMINATOR_FIX_ALLOWED 1
 #define RAB_HAS_RTXDI_RESERVOIRS 1
-#define RTXDI_COHERENT_SPATIAL_NEIGHBOR_OFFSETS 1
+// Wave-uniform neighbor offsets correlate spatial reuse across a whole wave (16-wide strips) and, combined with
+// clamping to the screen bounds, make entire strips reuse a single edge pixel. This shows up as horizontal
+// streaks / shimmer on hard shadow edges and along the screen border that the denoiser cannot resolve (REMIX-6192).
+// Use per-pixel random offsets instead.
+#define RTXDI_COHERENT_SPATIAL_NEIGHBOR_OFFSETS 0
 
 #ifndef RTXDI_ENABLE_BSDF_DETAIL
 #define RTXDI_ENABLE_BSDF_DETAIL 1
@@ -70,38 +74,20 @@
 #include "rtx/pass/sparse_rendering/compact_active_pixels.slangh"
 
 [shader("compute")]
-[numthreads(16, 8, 1)]
-void main(int2 threadIndex : SV_DispatchThreadID)
+[numthreads(COMPACT_ACTIVE_PIXELS_CONSUMER_GROUP_SIZE_X, COMPACT_ACTIVE_PIXELS_CONSUMER_GROUP_SIZE_Y, 1)]
+void main(uint2 dispatchThreadId : SV_DispatchThreadID, uint3 groupId : SV_GroupID, uint groupIndex : SV_GroupIndex)
 {
-  if (any(threadIndex >= cb.camera.resolution))
+  uint2 threadIndex;
+  uvec2 compactedCoordinate;
+  if (!loadCompactedCoordinate(dispatchThreadId, groupId.x, groupIndex, ActivePixelCount,
+                              cb.camera.resolution, cb.sparseRenderingArgs, threadIndex, compactedCoordinate))
   {
     return;
   }
 
-  uvec2 remapped;
-  const bool isActive = loadPixelCoordinate(uint2(threadIndex), ActiveLocalPixelCoords,
-    cb.camera.resolution, cb.sparseRenderingArgs, remapped);
-  int2 pixelCoordinate = int2(remapped);
+  int2 pixelCoordinate = int2(loadLaunchPixelCoordinate(threadIndex, ActivePixelCoords, cb.sparseRenderingArgs));
 
-  if (!isActive) {
-    if (cb.sparseRenderingArgs.enableRtxdiReuseForInactivePixels) {
-      // Write GBufferLast before early-out (needed by subsequent passes)
-      RAB_Surface surface = RAB_GetGBufferSurface(pixelCoordinate, false);
-      if (!cb.enableReSTIRGI) {
-        imageStore(GBufferLast, pixelCoordinate, RAB_PackLastFrameGBuffer(surface));
-      }
-
-      // Pass through the reservoir from temporal reuse unchanged
-      RTXDI_Reservoir reservoir = RAB_LoadReservoir(pixelCoordinate, RTXDI_GetSpatialInputPage());
-      RAB_StoreReservoir(reservoir, pixelCoordinate, RTXDI_GetSpatialOutputPage());
-
-      // Neutral BSDF factor for inactive pixels
-      BSDFFactor[pixelCoordinate] = vec2(1);
-    }
-    return;
-  }
-
-  RAB_Surface surface = RAB_GetGBufferSurface(pixelCoordinate, false);
+  RAB_Surface surface = RAB_GetGBufferSurface(pixelCoordinate, false, int2(compactedCoordinate));
   if (!cb.enableReSTIRGI)
   {
     imageStore(GBufferLast, pixelCoordinate, RAB_PackLastFrameGBuffer(surface));
@@ -144,6 +130,9 @@ void main(int2 threadIndex : SV_DispatchThreadID)
   sparams.depthThreshold = 0.1;
   sparams.screenResolution = cb.camera.resolution;
 
+  // See RAB_GetInactiveGBufferSurface.
+  g_resampledPixelBaseReflectivity = surface.opaqueSurfaceMaterialInteraction.baseReflectivity;
+
   RTXDI_Reservoir result = RTXDI_SpatialResampling(
     pixelCoordinate,
     surface,
@@ -171,5 +160,5 @@ void main(int2 threadIndex : SV_DispatchThreadID)
     factor = clamp(factor, vec2(0), vec2(cb.enhanceBSDFDirectLightMaxValue));
   }
 #endif
-  BSDFFactor[pixelCoordinate] = vec2(factor);
+  BSDFFactor[compactedCoordinate] = vec2(factor);
 }
