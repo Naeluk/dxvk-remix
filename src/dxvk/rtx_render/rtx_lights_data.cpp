@@ -23,6 +23,7 @@
 #include "rtx_lights_data.h"
 #include "rtx_light_utils.h"
 #include "rtx_light_manager.h"
+#include "rtx_scene_manager.h"
 #include "rtx_options.h"
 
 #include <remix/remix_c.h>
@@ -122,7 +123,12 @@ namespace dxvk {
   void LightData::merge(const D3DLIGHT9& light) {
     // Special case, dont do any merging if we know we dont need to
     if (m_dirty != m_allDirty) {
-      std::optional<LightData> input = tryCreate(light);
+      const Vector3& fogColorNull = Vector3(0.0f, 0.0f, 0.0f);
+      if (m_lightType == LightType::Distant || light.Type == D3DLIGHT_DIRECTIONAL) {
+        std::optional<LightData> input = tryCreate(light, &fogColorNull); 
+      }
+      std::optional<LightData> input = tryCreate(light, nullptr);
+      
       if (input.has_value()) {
         merge(input.value()); // when converting from legacy lights, we always use the games transform
       }
@@ -170,7 +176,7 @@ namespace dxvk {
     }
   }
 
-  std::optional<LightData> LightData::tryCreate(const D3DLIGHT9& light) {
+  std::optional<LightData> LightData::tryCreate(const D3DLIGHT9& light, const Vector3* fogColor) {
     // Ensure the D3D9 Light is of a valid type
     // Note: This is done as some games will pass invalid data to various D3D9 calls and since the RtLight
     // requires a valid light type for construction it needs to be checked in advance to avoid issues.
@@ -198,7 +204,8 @@ namespace dxvk {
     case D3DLIGHT_SPOT:
       return std::optional<LightData>(std::in_place, createFromPointSpot(light));
     case D3DLIGHT_DIRECTIONAL:
-      return std::optional<LightData>(std::in_place, createFromDirectional(light));
+
+      return std::optional<LightData>(std::in_place, createFromDirectional(light, fogColor));
     }
     return {};
   }
@@ -344,7 +351,7 @@ namespace dxvk {
     m_isRelativeTransform { !absoluteTransform && !isOverrideLight } {
   }
 
-  LightData LightData::createFromDirectional(const D3DLIGHT9& light) {
+  LightData LightData::createFromDirectional(const D3DLIGHT9& light, const Vector3* fogColor) {
     auto output = LightData{ Distant };
 
     const Vector3 originalDirection { light.Direction.x, light.Direction.y, light.Direction.z };
@@ -355,8 +362,14 @@ namespace dxvk {
     // Z axis in this case.
     output.m_zAxis = safeNormalize(originalDirection, Vector3(0.0f, 0.0f, 1.0f));
     output.m_AngleRadians = LightManager::lightConversionDistantLightFixedAngle();
-    output.m_Color = Vector3{ light.Diffuse.r, light.Diffuse.g, light.Diffuse.b };
-    output.m_Intensity = LightManager::lightConversionDistantLightFixedIntensity();
+
+    if (fogColor) {
+      output.m_Intensity = ((fogColor->x + fogColor->y + fogColor->z) / 3.0f) * LightManager::lightConversionDistantLightFixedIntensity();
+    } else {
+      output.m_Intensity = 0.05;
+    }
+
+    output.m_Color = Vector3 { light.Diffuse.r, light.Diffuse.g, light.Diffuse.b };
 
     // Note: Changing this code will alter "stable" light hashes from D3D9 and potentially break replacement assets.
 
