@@ -1505,7 +1505,7 @@ namespace dxvk {
       }
       ImGui::EndDisabled();
 #else
-      ImGui::TextWrapped("Nsight Graphics capture is supported only by x64 builds. See the build instructions in README.md.");
+      ImGui::TextWrapped("Nsight Graphics capture requires an x64 or ARM64EC build. See the build instructions in README.md.");
 #endif
 
       ImGui::Unindent();
@@ -2951,6 +2951,7 @@ namespace dxvk {
         RemixGui::InputInt("First N Untextured Draw Calls", &RtxOptions::skyDrawcallIdThresholdObject(), 1, 1, 0);
         RemixGui::SliderFloat("Sky Min Z Threshold", &RtxOptions::skyMinZThresholdObject(), 0.0f, 1.0f);
         skyAutoDetectCombo.getKey(&RtxOptions::skyAutoDetectObject());
+        RemixGui::Checkbox("Use Sky Probe for Primary Rays", &CompositePass::skyUseProbeForPrimaryRaysObject());
 
         if (RemixGui::CollapsingHeader("Advanced", collapsingHeaderClosedFlags)) {
           ImGui::Indent();
