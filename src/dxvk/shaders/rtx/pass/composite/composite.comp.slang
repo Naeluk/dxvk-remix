@@ -579,12 +579,12 @@ void applyVolumetricLighting(
 
       // Convert the reconstructed view-space position into world space.
       const vec3 worldPosition =
-  mul(cb.camera.viewToWorld, vec4(viewPosition, 1.0f)).xyz;
+      mul(cb.camera.viewToWorld, vec4(viewPosition, 1.0f)).xyz;
 
       const float worldY = worldPosition.z;
 
       float horizonMask = createHorizonDepthMask(primaryLinearViewZ, 9000.0);
-  const float horizonY = horizonMask;
+      const float horizonY = horizonMask;
 
       if (cb.volumeArgs.enable)
       {
@@ -714,6 +714,7 @@ float createHorizonDepthMask(float linearViewZ, float maxDistance)
 
     // Smooth transition
     return smoothstep(0.0, 1.0, mask);
+}
 
 // Sparse rendering scale for sky and fog in-scatter: 1 / rate at active sparse misses, 0 at inactive ones, otherwise 1.
 float calculateRadianceScale(uint2 pixelCoordinate, bool pixelIsActive, bool primaryMiss)
@@ -835,7 +836,7 @@ vec4 compositeResult(
   // Add sky radiance
   applySkyContribution(pixelCoordinate, primaryRayDirections, primaryMiss, radianceScale, volumeAttenuation, radianceOutput);
 
-  const float primaryLinearViewZ = PrimaryLinearViewZ[pixelCoordinate];
+  //const float primaryLinearViewZ2 = PrimaryLinearViewZ[pixelCoordinate];
 
   const vec3 worldPosition =
   mul(cb.camera.viewToWorld, vec4(viewPosition, 1.0f)).xyz;
