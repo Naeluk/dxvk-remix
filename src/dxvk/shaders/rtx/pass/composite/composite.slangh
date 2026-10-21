@@ -28,47 +28,183 @@
 #define D3DFOG_EXP2   2
 #define D3DFOG_LINEAR 3
 
-vec4 calculateFog(float viewDistance)
+float getHorizonFogMask(float worldY, float horizonY, float bandThickness)
 {
-  if (cb.fogMode == D3DFOG_NONE)
+  // Gaussian-like mask: densest at horizon, decays above and below
+  float d = (worldY - horizonY) / max(bandThickness, 0.0001);
+  return exp(-0.5 * d * d);
+  //return (cb.fogEnd - viewDistance) * cb.fogScale;
+}
+
+// Calculate distance from world position to planet surface
+float calculateHeightAbovePlanet(vec3 worldPosition, vec3 planetCenter, vec3 sceneUpDirection)
+{
+  // Vector from planet center to world position
+  vec3 toPlanet = worldPosition - planetCenter;
+  
+  // Project onto the up direction to get height
+  float heightAboveSurface = dot(toPlanet, sceneUpDirection);
+  
+  return heightAboveSurface;
+}
+
+// Atmosphere-based fog mask: dense at horizon, dissipates toward sky
+float createAtmosphereFogMask(
+  vec3 worldPosition,
+  vec3 planetCenter,
+  vec3 sceneUpDirection,
+  float atmosphereHeight)
+{
+  // Get height above planet surface
+  float heightAbovePlanet = calculateHeightAbovePlanet(worldPosition, planetCenter, sceneUpDirection);
+  
+  // Normalize height relative to atmosphere thickness
+  float normalizedHeight = saturate(heightAbovePlanet / atmosphereHeight);
+  
+  // Create mask: dense at horizon (low height), fades toward sky (high height)
+  // Using exponential falloff for natural atmosphere density
+  float mask = exp(-normalizedHeight * 2.0);
+  
+  return mask;
+}
+
+float remap(float value, float inMin, float inMax, float outMin, float outMax)
+{
+    return outMin + (value - inMin) * (outMax - outMin) / (inMax - inMin);
+}
+
+// Optional clamped version
+float remapClamped(float value, float inMin, float inMax, float outMin, float outMax)
+{
+    float t = saturate((value - inMin) / (inMax - inMin));
+    return lerp(outMin, outMax, t);
+}
+
+// Calculate luminance from RGB
+float luminance(float3 color)
+{
+    return dot(color, float3(0.2126, 0.7152, 0.0722)); // standard Rec. 709 coefficients
+}
+
+// Increase color saturation
+float3 increaseSaturation(float3 color, float factor)
+{
+    float lum = luminance(color);
+    return lerp(float3(lum, lum, lum), color, factor);
+}
+
+// Reduce luminance
+float3 reduceLuminance(float3 color, float factor)
+{
+    // factor is between 0.0 and 1.0, e.g., 0.8 reduces brightness to 80%
+    return color * factor;
+}
+
+float3 adjustColor(float3 color, float saturationFactor, float luminanceFactor)
+{
+    // Step 1: Increase saturation / color intensity
+    color = increaseSaturation(color, saturationFactor);
+
+    // Step 2: Reduce luminance
+    color = reduceLuminance(color, luminanceFactor);
+
+    return color;
+}
+
+vec3 rgbToHsv(vec3 c)
+{
+  vec4 K = vec4(0.0, -1.0 / 3.0, 2.0 / 3.0, -1.0);
+  vec4 p = lerp(vec4(c.bg, K.wz), vec4(c.gb, K.xy), step(c.b, c.g));
+  vec4 q = lerp(vec4(p.xyw, c.r), vec4(c.r, p.yzx), step(p.x, c.r));
+
+  float d = q.x - min(q.w, q.y);
+  float e = 1e-10;
+  return vec3(abs(q.z + (q.w - q.y) / (6.0 * d + e)),
+              d / (q.x + e),
+              q.x);
+}
+
+vec3 hsvToRgb(vec3 c)
+{
+  vec4 K = vec4(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);
+  vec3 p = abs(frac(c.xxx + K.xyz) * 6.0 - K.www);
+  return c.z * lerp(K.xxx, saturate(p - K.xxx), c.y);
+}
+
+// Increase saturation and value (multiplicative)
+vec3 adjustSatVal(vec3 color, float satMul, float valMul)
+{
+  vec3 hsv = rgbToHsv(color);
+  hsv.y = saturate(hsv.y * satMul);
+  hsv.z = saturate(hsv.z * valMul);
+  return hsvToRgb(hsv);
+}
+
+vec4 calculateFog(float viewDistance, float worldY, vec3 worldPosition, CameraDirections primaryRayDirections, uint2 pixelCoordinate, bool primaryMiss)
+{
+  float heightMask = createAtmosphereFogMask(
+    worldPosition,
+    cb.volumeArgs.planetCenter  , /// 100 / 500
+    cb.volumeArgs.sceneUpDirection,
+    cb.volumeArgs.atmosphereHeight  * 71110); //167 * 11111
+  
+
+  heightMask = lerp(1.0, 0.0, heightMask);
+  heightMask = clamp(heightMask, 0.0, 1.0);   
+   if (heightMask > 0.0001)  { heightMask = heightMask * 8.0; }
+
+  heightMask = remap(heightMask, 0.3, 0.0, 1.0, 0.0);
+
+  float heightMask2 = calculateHeightAbovePlanet(worldPosition, 10000, cb.volumeArgs.sceneUpDirection);
+  heightMask2 = saturate(heightMask2 / 10000000 );
+
+  heightMask2 = remap(heightMask2, 0.0, 1.0, 0.0, 10.0);
+  heightMask2 = clamp(heightMask2, 0.0, 1.0);
+  heightMask = heightMask2;
+
+  viewDistance = clamp(viewDistance, 0.0, cb.maxFogDistance);
+  float distanceFog = (cb.fogEnd - viewDistance) * cb.fogScale;
+
+  float fogAmount = clamp(distanceFog + (heightMask), 0.0, 1.0) + heightMask; //* clamp(heightMask, 0.0, 1.0)  * 1.3
+
+  vec3 fogSkyColor;
+  if (distanceFog < cb.maxFogDistance)//(cb.domeLightArgs.active)
   {
-    return vec4(0.0);
+    fogSkyColor = cb.domeLightArgs.radiance * sampleDomeLightTexture(
+      SkyLight, 
+      primaryRayDirections.worldDirection, 
+      cb.domeLightArgs.worldToLightTransform);
+  }
+  else
+  {
+    vec2 screenUV = cameraPixelCoordinateToScreenUV(cb.camera, pixelCoordinate);
+    fogSkyColor = SkyLight.SampleLevel(screenUV, 0);
   }
 
-  // Hack: Lets the current fog system look fine on maps with a skybox, to be removed once we read fog parameters
-  // properly from the game as they will specify how exactly the fog should look (if its even enabled rather than having
-  // it enabled by default).
-  if (viewDistance > cb.maxFogDistance)
-  {
-    return vec4(0.0);
-  }
+     vec3 fogSkyColor1 = cb.domeLightArgs.radiance * sampleDomeLightTexture(
+      SkyLight, 
+      primaryRayDirections.worldDirection, 
+      cb.domeLightArgs.worldToLightTransform);
 
-  // https://docs.microsoft.com/en-us/windows/win32/direct3d9/fog-formulas
+       vec2 screenUV = cameraPixelCoordinateToScreenUV(cb.camera, pixelCoordinate);
+    vec3 fogSkyColor2 = SkyLight.SampleLevel(screenUV, 0);
 
-  float f = 0;
+        float saturationFactor = 1.9; // Increase color intensity
+    float luminanceFactor = 0.2;  // Reduce luminance
 
-  if (cb.fogMode == D3DFOG_LINEAR)
-  {
-    // Note: Clamp the view distance to the range of the fog effect.
-    // Todo: Add in the min fog distance too potentially as this is currently missing.
-    viewDistance = clamp(viewDistance, 0.0f, cb.maxFogDistance);
+    float3 adjustedColor = adjustColor(fogSkyColor2, saturationFactor, luminanceFactor);
 
-    f = (cb.fogEnd - viewDistance) * cb.fogScale;
-  }
-  else if (cb.fogMode == D3DFOG_EXP)
-  {
-    float d = viewDistance * cb.fogDensity;
-    f = exp(-d);
-  }
-  else if (cb.fogMode == D3DFOG_EXP2)
-  {
-    float d = viewDistance * cb.fogDensity;
-    f = exp(-d * d);
-  }
+  vec3 finalFogColor = mix(fogSkyColor, cb.fogColor, 0.5) * cb.skyBrightness;
+  
+  vec3 finalFogColor2 = adjustSatVal(fogSkyColor2, 1.5, 0.5);
+  finalFogColor = mix(finalFogColor, finalFogColor2 , heightMask2);
 
-  f = clamp(f, 0.0, 1.0);
+  vec3 hsv = rgbToHsv(finalFogColor);
+  hsv.z = min(hsv.z, 0.5);
+  finalFogColor = hsvToRgb(hsv);
 
-  return vec4(cb.fogColor, 1.0 - f);
+
+  return vec4(finalFogColor, 1.0 - fogAmount);
 }
 
 void unpackDenoiserRadiance(inout float3 radiance, uint denoiserMode)
