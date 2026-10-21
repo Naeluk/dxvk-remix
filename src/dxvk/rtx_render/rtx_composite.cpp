@@ -403,11 +403,20 @@ namespace dxvk {
     compositeArgs.camera = sceneManager.getCamera().getShaderConstants();
     compositeArgs.frameIdx = frameIdx;
 
+    float skyBrightnessFromFogAverage = RtxOptions::skyBrightness();
+
     if (enableFog()) {
-      const float colorScale = fogColorScale();
-      auto& fog = settings.fog;
+      vec3 fogNative = sceneManager.getFogState().color;
+      const float avgFogColor = (fogNative.x + fogNative.y + fogNative.z) / 3.0f;
+
+      const auto& fog = settings.fog;
+
+      skyBrightnessFromFogAverage = avgFogColor;
       compositeArgs.fogMode = fog.mode;
-      compositeArgs.fogColor = { fog.color.x * colorScale, fog.color.y * colorScale, fog.color.z * colorScale };
+      const float colorScale = fogColorScale();
+      const auto& fogNativeVK = sRGBGammaToLinear(dxvk::Vector3(fogNative.x, fogNative.y, fogNative.z));
+      fogNative = vec3(fogNativeVK.x, fogNativeVK.y, fogNativeVK.z);
+      compositeArgs.fogColor = { fogNative.x * colorScale, fogNative.y * colorScale , fogNative.z * colorScale };
       // Todo: Scene scale stuff ignored for now because scene scale stuff is not actually functioning properly. Add back in if it's ever fixed.
       // compositeArgs.fogEnd = fog.end * RtxOptions::sceneScale();
       // compositeArgs.fogScale = fog.scale * RtxOptions::sceneScale();
@@ -503,7 +512,9 @@ namespace dxvk {
     memcpy(&compositeArgs.rayPortalHitInfos[maxRayPortalCount], &portalData.previousRayPortalHitInfos, sizeof(portalData.previousRayPortalHitInfos));
 
     compositeArgs.domeLightArgs = domeLightArgs;
-    compositeArgs.skyBrightness = RtxOptions::skyBrightness();
+
+    const float skyBrightnessMlt = RtxOptions::skyBrightness();
+    compositeArgs.skyBrightness = skyBrightnessFromFogAverage * skyBrightnessMlt;
     compositeArgs.skyUseProbeForPrimaryRays = skyUseProbeForPrimaryRays();
 
     const bool sparseRenderingEnabled = rtOutput.m_raytraceArgs.sparseRenderingArgs.mode != SparseRenderingMode::Off;
