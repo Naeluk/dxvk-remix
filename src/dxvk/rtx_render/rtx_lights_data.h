@@ -52,7 +52,7 @@ struct remixapi_LightInfoUSDEXT;
 
 namespace dxvk {
   struct LightData {
-    static std::optional<LightData> tryCreate(const D3DLIGHT9& light);
+    static std::optional<LightData> tryCreate(const D3DLIGHT9& light, const Vector3* fogColor);
     static std::optional<LightData> tryCreate(const pxr::UsdPrim& lightPrim, const pxr::GfMatrix4f* pLocalToRoot, const bool isOverrideLight, const bool absoluteTransform);
     static std::optional<LightData> tryCreate(const remixapi_LightInfoUSDEXT& src);
 
@@ -85,7 +85,7 @@ namespace dxvk {
 
     explicit LightData(LightType lightType, bool isOverrideLight = false, bool absoluteTransform = true);
 
-    static LightData createFromDirectional(const D3DLIGHT9& light);
+    static LightData createFromDirectional(const D3DLIGHT9& light, const Vector3* fogColor);
     static LightData createFromPointSpot(const D3DLIGHT9& light);
 
     void merge(const LightData& input);
