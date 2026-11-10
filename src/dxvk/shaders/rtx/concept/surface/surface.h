@@ -160,6 +160,13 @@ struct Surface
     set { data2.w = newValue ? packedFlagSet(data2.w, 1 << 30) : packedFlagUnset(data2.w, 1 << 30); }
   }
 
+  // Sludge floating on water (rtx.sludgeTextures), see water_sim_sludge.slangh.
+  property bool isSludge
+  {
+    get { return packedFlagGet(data2.w, 1u << 31); }
+    set { data2.w = newValue ? packedFlagSet(data2.w, 1u << 31) : packedFlagUnset(data2.w, 1u << 31); }
+  }
+
   // Matrices
 
   property mat4x3 prevObjectToWorld
@@ -254,6 +261,10 @@ struct Surface
   {
     get { return asfloat(data12.xyz); }
   }
+  property uint eyeCorrectionIndex
+  {
+    get { return data11.w; }
+  }
 
   // Buffers
 
@@ -309,6 +320,12 @@ struct Surface
   {
     get { return data0b.w; }
     set { data0b.w = newValue; }
+  }
+
+  property bool hasParticleObjectPickingValues
+  {
+    get { return packedFlagGet(data0b.z, 1 << 2); }
+    set { data0b.z = newValue ? packedFlagSet(data0b.z, 1 << 2) : packedFlagUnset(data0b.z, 1 << 2); }
   }
 
   property uint positionOffset
@@ -486,8 +503,20 @@ struct Surface
 
   property uint objectPickingValue
   {
-    get { return data2.x; }
+    // A particle batch has no single owner without a primitive index.
+    get { return hasParticleObjectPickingValues ? 0 : data2.x; }
     set { data2.x = newValue; }
+  }
+
+  // Generated particles use the picking word for their buffer index and triangle count.
+  property uint16_t particlePickingBufferIndex
+  {
+    get { return uint16_t(data2.x); }
+  }
+
+  property uint16_t particlePickingPrimitivesPerParticle
+  {
+    get { return uint16_t(data2.x >> 16); }
   }
 
   // See RtEyeParams::eyeballOrigin (rtx_materials.h) for what this is decoded from.
@@ -526,9 +555,11 @@ struct MinimalSurfaceInteraction
 
 struct SurfaceInteraction : MinimalSurfaceInteraction
 {
+  // Raw AOVs retain the triangle normal before normal bending.
+  vec3 triangleNormal = 0.f;
+
 #ifdef GBUFFER_FEATURE_DEBUG_VIEW
 #if GBUFFER_FEATURE_DEBUG_VIEW
-  vec3 debugTriangleNormal = 0.f;
   vec3 debugInterpolatedVertexNormal = 0.f;
 #endif
 #endif
@@ -539,8 +570,16 @@ struct SurfaceInteraction : MinimalSurfaceInteraction
   vec2 textureGradientY = 0..xx;
   vec3 rawTangent = 0.f;
   vec3 rawBitangent = 0.f;
+  float rawTangentScale = 0.f;
+  // Populated only for render-target motion, before material/POM tangent adjustments.
+  vec3 previousTextureDpDu = 0.f;
+  vec3 previousTextureDpDv = 0.f;
+  bool previousTextureBasisValid = false;
   vec4 vertexColor = 0.0f;
   float triangleArea = 0.f;
+  // Distance along the view ray from the hit to the displaced surface (POM, or simulated water in the primary G-buffer pass).
+  // Positive where it lies behind the mesh, 0 without one.
+  float pomRayDistance = 0.f;
 };
 
 struct GBufferMemoryMinimalSurfaceInteraction

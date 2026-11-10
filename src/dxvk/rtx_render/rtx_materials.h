@@ -102,6 +102,8 @@ struct RtEyeParams {
   // NOTE: vectors can be unnormalized, and that scale denotes an iris size
   Vector3 eyeRightU = Vector3{ 1, 0, 0 };
   Vector3 eyeUpV = Vector3{ 0, 1, 0 };
+  // 0: ordinary world-space eye; 1: corrected viewmodel; 2: its portal-space clone.
+  uint32_t eyeViewModelMode = 0;
 };
 
 // Returns (cos, sin) of an angle in degrees.
@@ -194,6 +196,8 @@ struct RtSurface {
     uint16_t flags0 = 0;
     flags0 |= normalFormat == VK_FORMAT_R32_UINT ? 1 : 0;
     flags0 |= isVertexColorBakedLighting ? (1 << 1) : 0;
+    const bool hasParticleObjectPickingValues = particlePickingBufferIndex != kSurfaceInvalidBufferIndex;
+    flags0 |= hasParticleObjectPickingValues ? (1 << 2) : 0;
     // NOTE: Spare flags bits here
 
     writeGPUHelper(data, offset, flags0);
@@ -210,7 +214,11 @@ struct RtSurface {
     writeGPUHelper(data, offset, normalOffset);
     writeGPUHelper(data, offset, texcoordOffset);
     writeGPUHelper(data, offset, color0Offset);
-    writeGPUHelper(data, offset, objectPickingValue);
+    assert(!hasParticleObjectPickingValues || particlePickingPrimitivesPerParticle > 0);
+    const uint32_t pickingData = hasParticleObjectPickingValues
+      ? uint32_t(particlePickingBufferIndex) | (uint32_t(particlePickingPrimitivesPerParticle) << 16)
+      : objectPickingValue;
+    writeGPUHelper(data, offset, pickingData);
 
     writeGPUHelperExplicit<1>(data, offset, positionStride);
     writeGPUHelperExplicit<1>(data, offset, normalStride);
@@ -247,6 +255,7 @@ struct RtSurface {
     flags1 |= isMotionBlurMaskOut ?           (1 << 28) : 0;
     flags1 |= skipSurfaceInteractionSpritesheetAdjustment ? (1 << 29) : 0;
     flags1 |= isPreservePath ?                (1u << 30) : 0;
+    flags1 |= isSludge ?                      (1u << 31) : 0;
 
     writeGPUHelper(data, offset, flags1);
 
@@ -306,7 +315,7 @@ struct RtSurface {
       writeGPUHelper(data, offset, eyeParams->eyeRightU[0]);
       writeGPUHelper(data, offset, eyeParams->eyeRightU[1]);
       writeGPUHelper(data, offset, eyeParams->eyeRightU[2]);
-      writeGPUHelper(data, offset, uint32_t{});
+      writeGPUHelper(data, offset, eyeParams->eyeViewModelMode);
       writeGPUHelper(data, offset, eyeParams->eyeUpV[0]);
       writeGPUHelper(data, offset, eyeParams->eyeUpV[1]);
       writeGPUHelper(data, offset, eyeParams->eyeUpV[2]);
@@ -404,6 +413,9 @@ struct RtSurface {
 
   uint32_t surfaceMaterialIndex = kSurfaceInvalidSurfaceMaterialIndex;
 
+  uint16_t particlePickingBufferIndex = kSurfaceInvalidBufferIndex;
+  uint16_t particlePickingPrimitivesPerParticle = 0;
+
   bool isEmissive = false;
   bool isMatte = false;
   bool isStatic = false;
@@ -411,6 +423,7 @@ struct RtSurface {
   bool isPreservePath = false;
   bool hasMaterialChanged = false;
   bool isAnimatedWater = false;
+  bool isSludge = false; // Sludge floats and opens as water where disturbed (see rtx.sludgeTextures)
   bool isClipPlaneEnabled = false;
   bool isTextureFactorBlend = false;
   bool isVertexColorBakedLighting = true;
@@ -437,6 +450,8 @@ struct RtSurface {
         && texcoordOffset == surface.texcoordOffset
         && color0BufferIndex == surface.color0BufferIndex
         && color0Offset == surface.color0Offset
+        && particlePickingBufferIndex == surface.particlePickingBufferIndex
+        && particlePickingPrimitivesPerParticle == surface.particlePickingPrimitivesPerParticle
         && firstIndex == surface.firstIndex;
   }
 
@@ -480,6 +495,7 @@ struct RtSurface {
       "  isPreservePath: ", isPreservePath, "\n",
       "  hasMaterialChanged: ", hasMaterialChanged, "\n",
       "  isAnimatedWater: ", isAnimatedWater, "\n",
+      "  isSludge: ", isSludge, "\n",
       "  isClipPlaneEnabled: ", isClipPlaneEnabled, "\n",
       "  isTextureFactorBlend: ", isTextureFactorBlend, "\n",
       "  isMotionBlurMaskOut: ", isMotionBlurMaskOut, "\n",
@@ -657,7 +673,7 @@ struct RtOpaqueSurfaceMaterial {
     float dlssControlMaskStructuralStrength,
     uint32_t subsurfaceMaterialIndex, bool isRaytracedRenderTarget, bool isHairCard,
     uint16_t samplerFeedbackStamp,
-    uint32_t secondaryTextureIndex = 0
+    uint32_t secondaryTextureIndex = 0, bool albedoOpacityIsRenderTarget = false
   ) :
     m_albedoOpacityTextureIndex{ albedoOpacityTextureIndex }, m_secondaryTextureIndex{secondaryTextureIndex}, m_normalTextureIndex{ normalTextureIndex },
     m_tangentTextureIndex { tangentTextureIndex }, m_heightTextureIndex { heightTextureIndex }, m_roughnessTextureIndex{ roughnessTextureIndex },
@@ -669,7 +685,7 @@ struct RtOpaqueSurfaceMaterial {
     m_ignoreAlphaChannel { ignoreAlphaChannel }, m_enableThinFilm { enableThinFilm }, m_alphaIsThinFilmThickness { alphaIsThinFilmThickness },
     m_thinFilmThicknessConstant { thinFilmThicknessConstant }, m_samplerIndex{ samplerIndex }, m_displaceIn{ displaceIn },
     m_displaceOut{ displaceOut },
-    m_enableDlssControlMask{ enableDlssControlMask },
+    m_enableDlssControlMask{ enableDlssControlMask }, m_albedoOpacityIsRenderTarget(albedoOpacityIsRenderTarget),
     m_dlssControlMaskIntensity{ dlssControlMaskIntensity },
     m_dlssControlMaskToneStrength{ dlssControlMaskToneStrength },
     m_dlssControlMaskStructuralStrength{ dlssControlMaskStructuralStrength },
@@ -705,6 +721,12 @@ struct RtOpaqueSurfaceMaterial {
 
     if (m_isRaytracedRenderTarget) {
       flags |= OPAQUE_SURFACE_MATERIAL_FLAG_IS_RAYTRACED_RENDER_TARGET;
+      if (m_albedoOpacityIsRenderTarget) {
+        flags |= OPAQUE_SURFACE_MATERIAL_FLAG_ALBEDO_IS_RENDER_TARGET;
+      }
+      if (m_enableEmission) {
+        flags |= OPAQUE_SURFACE_MATERIAL_FLAG_ENABLE_RENDER_TARGET_EMISSION;
+      }
     }
 
     if (m_isHairCard) {
@@ -920,6 +942,7 @@ private:
       uint32_t isHairCard;                // NOTE: uint32_t to avoid padding
       uint32_t samplerFeedbackStamp;      // NOTE: uint32_t to avoid padding
       uint32_t secondaryTextureIndex;
+      uint32_t albedoOpacityIsRenderTarget;
       // NOTE: There must be NO padding between members, as the struct is used for hashing
     };
     HashStruct hashData = HashStruct{
@@ -950,6 +973,7 @@ private:
       m_isHairCard,
       m_samplerFeedbackStamp,
       m_secondaryTextureIndex,
+      m_albedoOpacityIsRenderTarget,
     };
     m_cachedHash = hashStructByMemory<HashStruct,
       &HashStruct::albedoOpacityTextureIndex,
@@ -978,7 +1002,8 @@ private:
       &HashStruct::isRaytracedRenderTarget,
       &HashStruct::isHairCard,
       &HashStruct::samplerFeedbackStamp,
-      &HashStruct::secondaryTextureIndex>(hashData);
+      &HashStruct::secondaryTextureIndex,
+      &HashStruct::albedoOpacityIsRenderTarget>(hashData);
   }
 
   void updateCachedData() {
@@ -1027,6 +1052,7 @@ private:
   // How far outwards a height_texture value of 1 maps to.
   float m_displaceOut;
   bool m_enableDlssControlMask;
+  bool m_albedoOpacityIsRenderTarget;
   float m_dlssControlMaskIntensity;
   float m_dlssControlMaskToneStrength;
   float m_dlssControlMaskStructuralStrength;

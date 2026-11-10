@@ -285,6 +285,15 @@ namespace dxvk {
   }
 
   void RtxContext::resetScreenResolution(const VkExtent3D& upscaleExtent) {
+    // Defer NGX-dependent resolution setup until a scene needs a camera. This
+    // keeps device creation and raster loading screens independent of NGX, without
+    // temporarily choosing a fallback resolution that would alter camera jitter.
+    if (RtxOptions::isDLSSOrRayReconstructionEnabled() && !m_common->metaNGXContext().isInitializationComplete()) {
+      m_pendingScreenResolution = upscaleExtent;
+      return;
+    }
+    m_pendingScreenResolution.reset();
+
     // Calculate extents based on if DLSS is enabled or not
     const VkExtent3D downscaleExtent = setDownscaleExtent(upscaleExtent);
 
@@ -316,6 +325,14 @@ namespace dxvk {
     // Therefore reloadTextureWhenResolutionChanged is set to OFF by default to improve performance. 
     if (RtxOptions::reloadTextureWhenResolutionChanged()) {
       getSceneManager().requestTextureVramFree();
+    }
+  }
+
+  void RtxContext::prepareScreenResolution() {
+    if (m_pendingScreenResolution) {
+      const VkExtent3D upscaleExtent = *m_pendingScreenResolution;
+      m_common->metaNGXContext().waitForInitialization();
+      resetScreenResolution(upscaleExtent);
     }
   }
 
@@ -543,10 +560,15 @@ namespace dxvk {
 
     m_device->setPresentThrottleDelay(computedPresentThrottleDelay);
 
+    // Scheduled capture requests are queued before the early outs below so they stay pending until a ray traced frame services them.
+    const Rc<GameCapturer> capturer = common->capturer();
+    capturer->triggerScheduledCapture(m_device->getCurrentFrameId());
+
     // Early out if ray tracing is not supported or if Remix has already been injected
 
     if (!m_rayTracingSupported) {
       ONCE(Logger::info(str::format("[RTX-Compatibility-Info] Raytracing doesn't appear to be supported on this HW.")));
+      capturer->reportPendingCaptureBlocked("ray tracing is not supported on this hardware");
       return;
     }
 
@@ -563,11 +585,22 @@ namespace dxvk {
       m_frameLastInjected = m_device->getCurrentFrameId();
     }
 
-    if (RtxOptions::upscalerType() == UpscalerType::DLSS && !common->metaDLSS().supportsDLSS()) {
+    // Loading screens can present while NGX initializes, but the first ray-traced
+    // scene must wait for its capabilities. Skipping valid scene frames here would
+    // make temporal history and frame-based screenshots/captures depend on NGX timing.
+    auto& ngxContext = common->metaNGXContext();
+    if (isRaytracingEnabled && isCameraValid && !asyncShaderCompilationActive && !ngxContext.isInitializationComplete()) {
+      ngxContext.waitForInitialization();
+    }
+    const bool ngxInitializationComplete = ngxContext.isInitializationComplete();
+
+    // Pending capabilities are not unsupported capabilities. Preserve the user's
+    // requested features while the loading screen is being rendered.
+    if (ngxInitializationComplete && RtxOptions::upscalerType() == UpscalerType::DLSS && !common->metaDLSS().supportsDLSS()) {
       RtxOptions::upscalerType.setDeferred(UpscalerType::TAAU);
     }
 
-    if (DxvkDLFG::enable() && !common->metaDLFG().supportsDLFG()) {
+    if (ngxInitializationComplete && DxvkDLFG::enable() && !common->metaDLFG().supportsDLFG()) {
       DxvkDLFG::enable.setDeferred(false);
     }
     
@@ -600,7 +633,8 @@ namespace dxvk {
     bool raytracedThisFrame = false;
 
     // Note: Only engage ray tracing when it is enabled, the camera is valid and when no shaders are currently being compiled asynchronously (as
-    // trying to render before shaders are done compiling will cause Remix to block).
+    // trying to render before shaders are done compiling will cause Remix to block). NGX capabilities are ready
+    // here because a renderable scene waits for initialization above.
     if (isRaytracingEnabled && isCameraValid && !asyncShaderCompilationActive) {
       if (targetImage == nullptr) {
         targetImage = m_state.om.renderTargets.color[0].view->image();  
@@ -610,11 +644,6 @@ namespace dxvk {
       const bool captureScreenImage = s_triggerScreenshot || (captureTestScreenshot && !s_capturePrePresentTestScreenshot);
       const bool captureDebugImage = RtxOptions::captureDebugImage();
       
-      if (s_triggerUsdCapture) {
-        s_triggerUsdCapture = false;
-        m_common->capturer()->triggerNewCapture();
-      }
-
       if (captureTestScreenshot) {
         Logger::info(str::format("RTX: Test screenshot capture triggered"));
         Logger::info(str::format("RTX: Use separate denoiser ", RtxOptions::denoiseDirectAndIndirectLightingSeparately()));
@@ -821,6 +850,14 @@ namespace dxvk {
 
       m_framesWithoutValidScene = 0;
     } else {
+      if (!isRaytracingEnabled) {
+        capturer->reportPendingCaptureBlocked("ray tracing is disabled");
+      } else if (!isCameraValid) {
+        capturer->reportPendingCaptureBlocked("no valid camera is detected");
+      } else {
+        capturer->reportPendingCaptureBlocked("shaders are still compiling");
+      }
+
       // If raytracing is only disabled because we don't have shaders available, we don't want to clear the scene.
       // This frequently happens for a single frame when a cached shader is being fetched, and causes the Logic 
       // graph state to be reset - which is problematic since Logic graphs often trigger shader fetches.
@@ -896,15 +933,26 @@ namespace dxvk {
     }
     s_triggerScreenshot = false;
 
-    // Some time in the future kill process
-    if (m_triggerDelayedTerminate &&
-        (m_device->getCurrentFrameId() > m_terminateAppFrameNum) &&
-        m_common->capturer()->isIdle()) {
-      Logger::info(str::format("RTX: Terminating application"));
-      Metrics::serialize();
-      getCommonObjects()->metaExporter().waitForAllExportsToComplete();
+    // Some time in the future kill process.
+    // Captures only advance on frames that can ray trace a scene, so pending requests are cancelled after a timeout.
+    if (m_triggerDelayedTerminate && (m_device->getCurrentFrameId() > m_terminateAppFrameNum)) {
+      const Rc<GameCapturer> capturer = m_common->capturer();
+      const float timeoutSeconds = GameCapturer::pendingRequestTerminateTimeoutSeconds();
+      const auto timeout = std::chrono::duration_cast<CaptureTerminationGuard::Clock::duration>(std::chrono::duration<float>(timeoutSeconds));
+      const CaptureTerminationGuard::Action action =
+        m_captureTerminationGuard.update(!capturer->isIdle(), capturer->hasPendingCapture(), CaptureTerminationGuard::Clock::now(), timeout);
 
-      env::killProcess();
+      if (action == CaptureTerminationGuard::Action::CancelPendingRequest) {
+        capturer->cancelPendingCapture(str::format("DXVK_TERMINATE_APP_FRAME waited ", timeoutSeconds, " seconds for it to start"));
+      }
+
+      if (action != CaptureTerminationGuard::Action::Wait) {
+        Logger::info(str::format("RTX: Terminating application"));
+        Metrics::serialize();
+        getCommonObjects()->metaExporter().waitForAllExportsToComplete();
+
+        env::killProcess();
+      }
     }
 
     // This needs to happen at the end of frame, after ImGUI rendering
@@ -1005,6 +1053,8 @@ namespace dxvk {
 
     // Sync any pending work with geometry processing threads
     if (drawCallState.finalizePendingFutures(lastCamera)) {
+      // Camera projection jitter must use the final DLSS/RR render resolution.
+      prepareScreenResolution();
       drawCallState.cameraType = cameraManager.processCameraData(drawCallState);
 
       if (drawCallState.cameraType == CameraType::Unknown) {
@@ -1042,7 +1092,8 @@ namespace dxvk {
       // Note: TerrainBaking already applies this transform for TexGenMode::CascadedViewPositions 
       if ((transformData.texgenMode == TexGenMode::ViewPositions
            || transformData.texgenMode == TexGenMode::ViewNormals)
-          && RtCamera::enableFreeCamera()) {
+          && RtCamera::enableFreeCamera()
+          && !drawCallState.isEye()) {
         if (cameraManager.isCameraValid(CameraType::Main)) {
           const RtCamera& camera = cameraManager.getMainCamera();
           // Revert the main camera's viewToWorld transform and then apply the free camera's one
@@ -1355,6 +1406,11 @@ namespace dxvk {
     // TODO: should be a spec.const
     constants.enableObjectPicking = bool { rtOutput.m_primaryObjectPicking.isValid() };
 
+    constants.rawAovMask = (rtOutput.m_primaryWorldPositionRaw.isValid() ? kRawAovWorldPosition : 0u)
+                        | (rtOutput.m_primaryTexcoordsRaw.isValid() ? kRawAovTexcoords : 0u)
+                        | (rtOutput.m_primaryNormalF32.isValid() ? kRawAovNormal : 0u);
+    constants.enableCoverageAov = rtOutput.m_primaryCoverage.isValid() ? 1u : 0u;
+
     // Debug View
     {
       const DebugView& debugView = m_common->metaDebugView();
@@ -1415,6 +1471,8 @@ namespace dxvk {
     constants.startInMediumMaterialIndex = getSceneManager().getStartInMediumMaterialIndex();
     OpaqueMaterialOptions::fillShaderParams(constants.opaqueMaterialArgs);
     TranslucentMaterialOptions::fillShaderParams(constants.translucentMaterialArgs);
+    m_common->metaWaterSim().fillShaderParams(constants.waterSimArgs);
+    constants.waterSimArgs.sludgeWaterMaterialIndex = getSceneManager().getSludgeWaterMaterialIndex();
     ViewDistanceOptions::fillShaderParams(constants.viewDistanceArgs, RtxOptions::getMeterToWorldUnitScale());
     constants.alphaBlendSurfacePackMult = RtxOptions::getMeterToWorldUnitScale();
 
@@ -1483,7 +1541,16 @@ namespace dxvk {
     constants.eyeArgs.normalBendingCornea = RtxOptions::Eye::corneaSphereOffset();
     constants.eyeArgs.whitesAlbedoScale = RtxOptions::Eye::eyeWhitesAlbedoScale();
     constants.eyeArgs.irisRadius = RtxOptions::Eye::irisRadius();
-    constants.eyeArgs.irisDepth = RtxOptions::Eye::irisDepth();
+    constants.eyeArgs.irisDepthScale = RtxOptions::Eye::irisDepthScale();
+    constants.eyeArgs.limbalRingScale = RtxOptions::Eye::limbalRingScale();
+    constants.eyeArgs.roughness = RtxOptions::Eye::roughness();
+    const auto& eyeShadingToWorld = getSceneManager().getInstanceManager().getEyeShadingToWorld();
+    const auto& eyeWorldToShading = getSceneManager().getInstanceManager().getEyeWorldToShading();
+
+    for (uint32_t i = 0; i < std::size(constants.eyeArgs.corrections); i++) {
+      constants.eyeArgs.corrections[i].shadingToWorld = eyeShadingToWorld[i];
+      constants.eyeArgs.corrections[i].worldToShading = eyeWorldToShading[i];
+    }
 
     constants.shadowTerminatorArgs.soften = RtxOptions::ShadowTerminator::soften();
 

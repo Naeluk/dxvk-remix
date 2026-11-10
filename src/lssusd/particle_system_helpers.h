@@ -47,8 +47,13 @@
 #include "../../public/include/remix/remix_c.h"
 #include "../dxvk/shaders/rtx/pass/particles/particle_system_enums.h"
 
+#define LIST_PARTICLE_SCREEN_SIZE_PROPERTIES(FLOAT) \
+  FLOAT(minScreenSize, 0.0f) \
+  FLOAT(maxScreenSize, 0.0f) \
+  FLOAT(screenSizeCoverage, 1.0f)
+
 namespace lss {
-  inline constexpr std::size_t kParticleSystemSchemaPropertyCount = 129;
+  inline constexpr std::size_t kParticleSystemSchemaPropertyCount = 133;
 
   template<typename TDest, typename TSrc>
   inline TDest AssignFromPrimvar(const TSrc& src) {
@@ -128,6 +133,12 @@ namespace lss {
       return ParticleRandomFlipAxis::Both;
     }
     return ParticleRandomFlipAxis::None;
+  }
+
+  template<>
+  inline ParticleSpawnDistribution AssignFromPrimvar<ParticleSpawnDistribution, pxr::TfToken>(const pxr::TfToken& token) {
+    static const pxr::TfToken kBySurfaceArea("BySurfaceArea");
+    return token == kBySurfaceArea ? ParticleSpawnDistribution::BySurfaceArea : ParticleSpawnDistribution::ByTriangle;
   }
 
   template<typename T>

@@ -157,7 +157,7 @@ namespace dxvk {
   namespace {
     template<int RtInstanceSize> struct CheckRtInstanceSize {
       // The second line of the build error should contain the new size of RtInstance in the template argument, i.e. `dxvk::CheckRtInstanceSize<newSize>`
-      static_assert(RtInstanceSize == 784, "RtInstance size has changed.  Fix the copy constructor above this message, then update the expected size.");
+      static_assert(RtInstanceSize == 792, "RtInstance size has changed. Fix the copy constructor above this message, then update the expected size.");
     };
     CheckRtInstanceSize<sizeof(RtInstance)> _rtInstanceSizeTest;
   }
@@ -176,6 +176,8 @@ namespace dxvk {
     surface.positionBufferIndex = geo.positionBufferIndex;
     surface.positionOffset      = geo.positionBuffer.offsetFromSlice();
     surface.positionStride      = geo.positionBuffer.stride();
+    surface.particlePickingBufferIndex = static_cast<uint16_t>(geo.particlePickingBufferIndex);
+    surface.particlePickingPrimitivesPerParticle = geo.particlePickingPrimitivesPerParticle;
     surface.normalBufferIndex   = geo.normalBufferIndex;
     surface.normalOffset        = geo.normalBuffer.offsetFromSlice();
     surface.normalStride        = geo.normalBuffer.stride();
@@ -1061,6 +1063,8 @@ namespace dxvk {
        !currentInstance.isCameraRegistered(CameraType::Main));
 
     const RtSurface::AlphaState alphaState = calculateAlphaState(drawCall, *materialData);
+    // The patched material must remain alive until preserveInstance invokes material binding callbacks.
+    std::optional<MaterialData> patchedMaterialData;
     bool hasTransformChanged = false;
     bool hasPreviousPositions = false;
 
@@ -1112,6 +1116,7 @@ namespace dxvk {
         currentInstance.surface.tFactor = drawCall.getMaterialData().tFactor;
         currentInstance.surface.alphaState = alphaState;
         currentInstance.surface.isAnimatedWater = currentInstance.testCategoryFlags(InstanceCategories::AnimatedWater);
+        currentInstance.surface.isSludge = currentInstance.testCategoryFlags(InstanceCategories::Sludge);
         currentInstance.surface.associatedGeometryHash = drawCall.getHash(RtxOptions::geometryAssetHashRule());
         currentInstance.surface.isTextureFactorBlend = drawCall.getMaterialData().isTextureFactorBlend;
         currentInstance.surface.isVertexColorBakedLighting = drawCall.getMaterialData().isVertexColorBakedLighting;
@@ -1128,29 +1133,27 @@ namespace dxvk {
         currentInstance.m_isAnimated = currentInstance.surface.spriteSheetFPS != 0 || currentInstance.surface.textureScrollSpeed != Vector2(0.f);
         currentInstance.surface.objectPickingValue = drawCall.drawCallID;
 
-        // Temp storage for the case we need to patch the material data
-        MaterialData tmpMaterialData;
-
         if (materialData->getType() == MaterialDataType::Opaque)
         {
           const bool useLegacyAlphaState = materialData->getOpaqueMaterialData().getUseLegacyAlphaState();
 
-          if (currentInstance.m_isWorldSpaceUI) {
+          // Camera materials retain authored emission independently of legacy alpha blending.
+          if (!drawCall.isUsingRaytracedRenderTarget && currentInstance.m_isWorldSpaceUI) {
             // Here we need to do deep copy and patch the material
-            tmpMaterialData = *materialData;
-            materialData = &tmpMaterialData;
+            patchedMaterialData.emplace(*materialData);
+            materialData = &*patchedMaterialData;
             // For worldspace UI, we want to show the UI (unlit) in the world.  So configure the blend mode if blending is used accordingly.
-            tmpMaterialData.getOpaqueMaterialData().setEnableEmission(true);
-            tmpMaterialData.getOpaqueMaterialData().setEmissiveIntensity(2.0f);
-            tmpMaterialData.getOpaqueMaterialData().setEmissiveColorTexture(tmpMaterialData.getOpaqueMaterialData().getAlbedoOpacityTexture());
-          } else if (currentInstance.surface.alphaState.emissiveBlend && RtxOptions::enableEmissiveBlendEmissiveOverride() && useLegacyAlphaState) {
+            patchedMaterialData->getOpaqueMaterialData().setEnableEmission(true);
+            patchedMaterialData->getOpaqueMaterialData().setEmissiveIntensity(2.0f);
+            patchedMaterialData->getOpaqueMaterialData().setEmissiveColorTexture(patchedMaterialData->getOpaqueMaterialData().getAlbedoOpacityTexture());
+          } else if (!drawCall.isUsingRaytracedRenderTarget && currentInstance.surface.alphaState.emissiveBlend && RtxOptions::enableEmissiveBlendEmissiveOverride() && useLegacyAlphaState) {
             // Here we need to do deep copy and patch the material
-            tmpMaterialData = *materialData;
-            materialData = &tmpMaterialData;
+            patchedMaterialData.emplace(*materialData);
+            materialData = &*patchedMaterialData;
             // If the user has decided to override the legacy alpha state, assume they know what they are doing and allow for explicit emission controls.
-            tmpMaterialData.getOpaqueMaterialData().setEnableEmission(true);
-            tmpMaterialData.getOpaqueMaterialData().setEmissiveIntensity(RtxOptions::emissiveBlendOverrideEmissiveIntensity());
-            tmpMaterialData.getOpaqueMaterialData().setEmissiveColorTexture(tmpMaterialData.getOpaqueMaterialData().getAlbedoOpacityTexture());
+            patchedMaterialData->getOpaqueMaterialData().setEnableEmission(true);
+            patchedMaterialData->getOpaqueMaterialData().setEmissiveIntensity(RtxOptions::emissiveBlendOverrideEmissiveIntensity());
+            patchedMaterialData->getOpaqueMaterialData().setEmissiveColorTexture(patchedMaterialData->getOpaqueMaterialData().getAlbedoOpacityTexture());
           }
 
           currentInstance.m_isSubsurface = materialData->getOpaqueMaterialData().getSubsurfaceDiffusionProfile();
@@ -1539,6 +1542,24 @@ namespace dxvk {
       // If matrices are not convoluted, don't modify the vertex data: just set the transforms directly
       if (isOrdinary(corrected) && isOrdinary(prevCorrected)) {
         viewModelInstance->teleport(corrected, prevCorrected);
+
+        if (auto& eyeParams = viewModelInstance->surface.eyeParams) {
+          // Eye UVs are world-space plane projections, so move their origin with the geometry
+          // and transform U/V by the inverse transpose, without normalizing away iris scale.
+          // Reuse (C * M)^-T from teleport: (C * M)^-T * M^T = C^-T.
+          const Matrix3 eyeBasisCorrection = viewModelInstance->surface.normalObjectToWorld
+                                          * transpose(Matrix3(reference.getTransform()));
+          const Vector4d eyeOrigin(Vector3d(eyeParams->eyeballOrigin), 1.0);
+          eyeParams->eyeballOrigin = Vector3((perspectiveCorrection * eyeOrigin).xyz());
+          eyeParams->eyeRightU = eyeBasisCorrection * eyeParams->eyeRightU;
+          eyeParams->eyeUpV = eyeBasisCorrection * eyeParams->eyeUpV;
+          eyeParams->eyeViewModelMode = 1;
+          if (!m_hasViewModelEyeCorrection) {
+            m_eyeShadingToWorld[0] = Matrix3(perspectiveCorrection);
+            m_eyeWorldToShading[0] = transpose(eyeBasisCorrection);
+            m_hasViewModelEyeCorrection = true;
+          }
+        }
       } else {
         ONCE(Logger::info("[RTX-Compatibility-Info] Unexpected values in the perspective-corrected transform of a view model. Fallback to geometry modification"));
         // Only need to run this on BVH op (maybe this could be moved to geometry processing?)
@@ -1563,6 +1584,7 @@ namespace dxvk {
                                                  const CameraManager& cameraManager,
                                                  const RayPortalManager& rayPortalManager) {
     ScopedGpuProfileZone(ctx, "ViewModel");
+    m_hasViewModelEyeCorrection = false;
 
     auto cleanupAllPersistentViewModelInstances = [this]() {
       for (auto& [ref, inst] : m_persistentViewModelInstances) {
@@ -2064,6 +2086,12 @@ namespace dxvk {
     
     const uint32_t frameId = m_device->getCurrentFrameId();
 
+    if (m_hasViewModelEyeCorrection) {
+      const Matrix3 portalRotation(closestPortalInfo.portalToOpposingPortalDirection);
+      m_eyeShadingToWorld[1] = portalRotation * m_eyeShadingToWorld[0];
+      m_eyeWorldToShading[1] = m_eyeWorldToShading[0] * transpose(portalRotation);
+    }
+
     // Create or update virtual instances for view model instances that are close to portals
     std::unordered_set<RtInstance*> activeVirtualViewModelReferences;
     for (RtInstance* referenceInstance : viewModelReferenceInstances) {
@@ -2095,6 +2123,9 @@ namespace dxvk {
       // Update virtual instance transforms given the reference and the portal transform
       {
         virtualInstance->teleportWithHistory(closestPortalInfo.portalToOpposingPortalDirection);
+        if (virtualInstance->surface.eyeParams && virtualInstance->surface.eyeParams->eyeViewModelMode != 0) {
+          virtualInstance->surface.eyeParams->eyeViewModelMode = 2;
+        }
       }
     }
 

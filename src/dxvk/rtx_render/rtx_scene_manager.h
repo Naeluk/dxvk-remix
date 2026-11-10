@@ -201,6 +201,9 @@ public:
   const fast_unordered_cache<FogState>& getFogStates() const { return m_fogStates; }
 
   uint32_t getStartInMediumMaterialIndex() { return m_startInMediumMaterialIndex; }
+  // Returns the index into the surface materials of the water that sludge opens into, see RtxWaterSim::Sludge.
+  // Returns SURFACE_INDEX_INVALID while sludge is off.
+  uint32_t getSludgeWaterMaterialIndex() const { return m_sludgeWaterMaterialIndex; }
   
   uint32_t getActivePOMCount() {return m_activePOMCount;}
 
@@ -368,7 +371,6 @@ private:
   MaterialData determineMaterialData(const MaterialData* overrideMaterialData, const DrawCallState& input);
   
   const uint32_t kInvalidMaterialCacheIndex = UINT32_MAX;
-  uint32_t m_beginUsdExportFrameNum = -1;
   bool m_enqueueDelayedClear = false;
   bool m_previousFrameSceneAvailable = false;
 
@@ -403,11 +405,21 @@ private:
   uint32_t m_startInMediumMaterialIndex_inCache = kInvalidMaterialCacheIndex;
   uint32_t m_lastResolvedStartInMediumMaterialIndexInCache = kInvalidMaterialCacheIndex;
   uint32_t m_lastUploadedStartInMediumMaterialIndexInCache = kInvalidMaterialCacheIndex;
+  // The water that sludge opens into, uploaded after the camera medium.
+  uint32_t m_sludgeWaterMaterialIndex = SURFACE_INDEX_INVALID;
+  uint32_t m_sludgeWaterMaterialIndex_inCache = kInvalidMaterialCacheIndex;
+  uint32_t m_lastUploadedSludgeWaterMaterialIndexInCache = kInvalidMaterialCacheIndex;
 
   // TODO: Move the following resources and getters to RtResources class
   Rc<DxvkBuffer> m_surfaceMaterialBuffer;
   Rc<DxvkBuffer> m_surfaceMaterialExtensionBuffer;
   Rc<DxvkBuffer> m_volumeMaterialBuffer;
+
+  // CPU-side buffers to avoid per-frame allocations and page-faults in fresh pages. For performance.
+  // NOTE: not zeroed, like AccelManager's surface data: the GPU never reads padding, which release builds leave unwritten.
+  std::vector<unsigned char> m_scratchSurfaceMaterialsGPUData;
+  std::vector<unsigned char> m_scratchSurfaceMaterialExtensionsGPUData;
+  std::vector<unsigned char> m_scratchVolumeMaterialsGPUData;
 
   uint32_t m_activePOMCount = 0;
   

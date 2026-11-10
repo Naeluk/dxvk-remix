@@ -34,6 +34,7 @@
 #include "../d3d9/d3d9_state.h"
 #include "../../util/util_global_time.h"
 #include "rtx_matrix_helpers.h"
+#include "rtx_skipping_writer.h"
 
 #include "dxvk_scoped_annotation.h"
 #include "rtx_options.h"
@@ -916,6 +917,7 @@ namespace dxvk {
         blasRangesToBuild.push_back(&blasEntry->buildRanges[0]);
 
         copyAccelerationStructureBuildGeometryInfo(buildInfo, selectedBlas->buildInfo);
+        selectedBlas->hasOmmAttachments = boundOpacityMicromapHash != kEmptyHash;
       }
 
       for (RtInstance* rtInstance : uniqueBlasEntry.instances) {
@@ -1239,7 +1241,7 @@ namespace dxvk {
 
       // Must ensure that if we are updating an existing blas, rather than rebuilding, the blas is compatible with our new build info
       // Cannot update a blas that contains OMM instances, this leads to sporadic device lost errors
-      if (!bucket->hasOmmInstances && selectedBlas &&
+      if (!bucket->hasOmmInstances && selectedBlas && !selectedBlas->hasOmmAttachments &&
           selectedBlas->topologyHash == newTopologyHash &&
           validateUpdateMode(selectedBlas->buildInfo, buildInfo) &&
           selectedBlas->primitiveCounts == bucket->primitiveCounts) {
@@ -1315,6 +1317,7 @@ namespace dxvk {
 
         copyAccelerationStructureBuildGeometryInfo(buildInfo, selectedBlas->buildInfo);
         selectedBlas->primitiveCounts = bucket->primitiveCounts;
+        selectedBlas->hasOmmAttachments = bucket->hasOmmInstances;
 
         // Allocate a scratch buffer slice
         const size_t requiredScratchAllocSize = align(sizeInfo.buildScratchSize + m_scratchAlignment, m_scratchAlignment);
@@ -1690,7 +1693,14 @@ namespace dxvk {
     assert(dataOffset == surfacesGPUSize);
     assert(surfacesGPUData.size() == surfacesGPUSize);
 
-    ctx->writeToBuffer(m_surfaceBuffer, 0, surfacesGPUData.size(), surfacesGPUData.data());
+    // PointInstancer copies are written by the GPU culling pass, so leave them out
+    {
+      SkippingWriter writer = SkippingWriter(*ctx, m_surfaceBuffer, surfacesGPUData.data());
+      for (const PointInstancerBatch& batch : m_pointInstancerBatches) {
+        writer.writeThenSkipGap((batch.baseSurfaceIndex + 1) * kSurfaceGPUSize, (batch.baseSurfaceIndex + batch.instanceCount) * kSurfaceGPUSize);
+      }
+      writer.writeUntil(surfacesGPUData.size());
+    }
 
     // Allocate and initialize the surface mapping buffer
     surfaceIndexMapping.resize(maxPreviousSurfaceIndex + 1);

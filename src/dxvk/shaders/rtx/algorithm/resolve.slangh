@@ -31,6 +31,7 @@
 #include "rtx/concept/ray/ray.slangh"
 #include "rtx/concept/surface/surface.slangh"
 #include "rtx/concept/surface_material/surface_material.slangh"
+#include "rtx/concept/surface_material/water_sim_sludge.slangh"
 #include "rtx/concept/volume/volume.slangh"
 #include "rtx/concept/volume_material/volume_material.slangh"
 #include "rtx/concept/ray_portal/ray_portal.slangh"
@@ -308,7 +309,8 @@ void resolveVertexFinalMiss<let overrideRayInteraction : bool, T : IBasePayloadS
 // Emissive radiance and attenuation may be accumulated immediately but the continueResolving flag must be checked to see if the
 // function should return and continue attempting to resolve an interaction. If false, the Ray Interaction can then be checked
 // for a hit and hit logic can be performed.
-void resolveVertex<T: IBasePayloadState>(
+// Returns only the opacity transmittance of skipped approximation hits.
+float resolveVertex<T: IBasePayloadState>(
   uint8_t resolveMode,
   RayHitInfo rayHitInfo, inout T resolveVertexState,
   inout Ray ray, inout RayInteraction rayInteraction,
@@ -316,7 +318,7 @@ void resolveVertex<T: IBasePayloadState>(
   inout PolymorphicSurfaceMaterialInteraction polymorphicSurfaceMaterialInteraction,
   inout vec3 radianceAttenuation, inout vec3 emissiveRadiance,
   uint4 decalMemory,
-  vec3 decalEmissiveRadiance,
+  f16vec3 decalEmissiveRadiance,
   float coneSpreadAngle,
   inout bool isStochasticAlphaBlend,
   inout uint8_t firstRayPortal,
@@ -326,7 +328,8 @@ void resolveVertex<T: IBasePayloadState>(
   // Needed for RayQuery paths for visibility rays from CHS as they don't run material specific hit groups
   // Visibility rays are expected not to start from RayPortal surfaces, and thus only RayPortal path is force enabled
   const bool forceEnableResolveRayPortal = false,
-  const bool useStochasticAlphaBlend = false)
+  const bool useStochasticAlphaBlend = false,
+  const bool computeRenderTargetMotion = false)
 {
   const Camera camera = cb.camera;
   bool teleport = false;
@@ -353,7 +356,7 @@ void resolveVertex<T: IBasePayloadState>(
     // Note: Ray interaction is already a miss here, so no need for this function to override it.
     resolveVertexFinalMiss<false>(resolveVertexState, rayInteraction, radianceAttenuation);
 
-    return;
+    return 1.0f;
   }
 
   resolveVertexState.segmentHitDistance = rayInteraction.hitDistance;
@@ -372,7 +375,14 @@ void resolveVertex<T: IBasePayloadState>(
 
   surface = surfaces[uint(rayInteraction.surfaceIndex)]; 
 
-  surfaceInteraction = surfaceInteractionCreate<SurfaceGenerateTangents>(surface, rayInteraction, ray);
+  bool computePreviousTextureBasis = false;
+  if (computeRenderTargetMotion && cb.enableRaytracedRenderTarget && rayInteraction.materialType == surfaceMaterialTypeOpaque)
+  {
+    const OpaqueSurfaceMaterial material = opaqueSurfaceMaterialCreate(surfaceMaterials[surface.surfaceMaterialIndex]);
+    computePreviousTextureBasis = (material.flags & OPAQUE_SURFACE_MATERIAL_FLAG_IS_RAYTRACED_RENDER_TARGET) != 0;
+  }
+  surfaceInteraction = surfaceInteractionCreate<SurfaceGenerateTangents>(surface, rayInteraction, ray,
+    false, kFootprintFromRayDirection, computePreviousTextureBasis);
 
   // Process user clip planes and view distance
 
@@ -380,7 +390,7 @@ void resolveVertex<T: IBasePayloadState>(
   {
     // Continue resolving when we hit a clipped geometry to find possible objects behind it.
     resolveVertexFinalContinue(ray, surfaceInteraction, teleport, teleportMatrix, resolveVertexState);
-    return;
+    return 1.0f;
   }
 
   if (!evalViewDistance(cb.viewDistanceArgs, cb.isZUp, camera, surfaceInteraction.position))
@@ -388,10 +398,20 @@ void resolveVertex<T: IBasePayloadState>(
     // Note: Treat view distance interactions as misses as no geometry should be processed past them
     // (since these operations essentially clip out everything beyond them in a specific direction).
     resolveVertexFinalMiss<true>(resolveVertexState, rayInteraction, radianceAttenuation);
-    return;
+    return 1.0f;
   }
 
   // Create a Surface Material and Surface Material Interaction from the Surface
+
+  // Sludge that the water simulation cleared at the hit is open water, see water_sim_sludge.slangh.
+  bool sludgeRidesWaves = surface.isSludge && cb.waterSimArgs.sludgeWaterMaterialIndex != SURFACE_INDEX_INVALID;
+  if (rayInteraction.materialType == surfaceMaterialTypeOpaque && waterSimSludgeIsOpen(surface, surfaceInteraction))
+  {
+    rayInteraction.materialType = surfaceMaterialTypeTranslucent;
+    surface.surfaceMaterialIndex = cb.waterSimArgs.sludgeWaterMaterialIndex;
+    surface.isAnimatedWater = true;
+    sludgeRidesWaves = false;
+  }
 
   const MemoryPolymorphicSurfaceMaterial memoryPolymorphicSurfaceMaterial = surfaceMaterials[surface.surfaceMaterialIndex];
   
@@ -410,16 +430,23 @@ void resolveVertex<T: IBasePayloadState>(
     OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteraction =
       opaqueSurfaceMaterialInteractionCreate(opaqueSurfaceMaterial, surface, surfaceInteraction, rayInteraction);
 
+    // Sludge rides the waves of the water simulation.
+    if (sludgeRidesWaves)
+    {
+      opaqueSurfaceMaterialInteraction.shadingNormal =
+        waterSimSludgeTiltNormal(surfaceInteraction, opaqueSurfaceMaterialInteraction.shadingNormal);
+    }
+
     // Blend any decal(s) that happened before this interaction
     if (decalMaterialBlending && resolveVertexState.decalEncountered)
     {
       MemoryDecalMaterialInteraction memory;
       memory.packed = decalMemory;
-      memory.emissiveRadiance = f16vec3(decalEmissiveRadiance);
+      memory.emissiveRadiance = decalEmissiveRadiance;
       DecalMaterialInteraction decalMaterialInteraction = decalMaterialInteractionUnpack(memory);
 
       decalMaterialInteractionBlend(decalMaterialInteraction, opaqueSurfaceMaterialInteraction);
-      
+
       resolveVertexState.decalEncountered = false;
     }
 
@@ -432,11 +459,19 @@ void resolveVertex<T: IBasePayloadState>(
     // the texture coordinates of the surface we hit
     if (cb.enableRaytracedRenderTarget && opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_IS_RAYTRACED_RENDER_TARGET)
     {
+      // NV-DXVK start: Transparent camera surfaces contribute neither image nor light.
+      if (opaqueSurfaceMaterialInteraction.opacity <= 0.0f)
+      {
+        isRaytracedRenderTarget = false;
+        resolveVertexFinalContinue(ray, surfaceInteraction, teleport, teleportMatrix, resolveVertexState);
+        return 1.0f;
+      }
+      // NV-DXVK end
       isRaytracedRenderTarget = true;
 
       resolveVertexFinalHit(resolveVertexState);
 
-      return;
+      return 1.0f;
     }
     else
     {
@@ -452,7 +487,7 @@ void resolveVertex<T: IBasePayloadState>(
 
       resolveVertexFinalHit(resolveVertexState);
 
-      return;
+      return 1.0f;
     }
 
     // Note: Backfacing hits on opaque materials for now are not considered as they have no relevant contribution for lighting. This may change however if thin opaque surfaces are added.
@@ -475,7 +510,7 @@ void resolveVertex<T: IBasePayloadState>(
       pomOpaqueSurfaceEncountered = opaqueSurfaceMaterial.hasValidDisplacement();
 
       resolveVertexFinalHit(resolveVertexState);
-      return;
+      return 1.0f;
     }
 
     // Handle opaque approximations
@@ -498,7 +533,7 @@ void resolveVertex<T: IBasePayloadState>(
         // Note: Must call resolve final on any return which expects resolving to continue.
         resolveVertexFinalContinue(ray, surfaceInteraction, teleport, teleportMatrix, resolveVertexState);
 
-        return;
+        return opaqueApproximationOutgoingAttenuation;
       }
     }
 
@@ -521,7 +556,7 @@ void resolveVertex<T: IBasePayloadState>(
       // Note: Must call resolve final on any return which expects resolving to continue.
       resolveVertexFinalContinue(ray, surfaceInteraction, teleport, teleportMatrix, resolveVertexState);
 
-      return;
+      return 1.0f;
     }
   }
   else if (SURFACE_MATERIAL_RESOLVE_TYPE_ACTIVE_MASK & SURFACE_MATERIAL_RESOLVE_TYPE_TRANSLUCENT &&
@@ -530,14 +565,14 @@ void resolveVertex<T: IBasePayloadState>(
     const TranslucentSurfaceMaterial translucentSurfaceMaterial = translucentSurfaceMaterialCreate(memoryPolymorphicSurfaceMaterial);
 
     TranslucentSurfaceMaterialInteraction translucentSurfaceMaterialInteraction =
-      translucentSurfaceMaterialInteractionCreate(translucentSurfaceMaterial, surface, surfaceInteraction, rayInteraction);
+      translucentSurfaceMaterialInteractionCreate(translucentSurfaceMaterial, surface, surfaceInteraction, rayInteraction, rayInteraction.hitDistance);
 
     // Blend any decal(s) that happened before this interaction
     if (decalMaterialBlending && resolveVertexState.decalEncountered)
     {
       MemoryDecalMaterialInteraction memory;
       memory.packed = decalMemory;
-      memory.emissiveRadiance = f16vec3(decalEmissiveRadiance);
+      memory.emissiveRadiance = decalEmissiveRadiance;
       DecalMaterialInteraction decalMaterialInteraction = decalMaterialInteractionUnpack(memory);
 
       decalMaterialInteractionBlend(decalMaterialInteraction, translucentSurfaceMaterialInteraction);
@@ -547,6 +582,61 @@ void resolveVertex<T: IBasePayloadState>(
 
     polymorphicSurfaceMaterialInteraction =
       polymorphicSurfaceMaterialInteractionCreateInternal(translucentSurfaceMaterialInteraction);
+
+#if defined(RAY_TRACING_PRIMARY_RAY) && !defined(GBUFFER_PSR) && defined(WATER_SIM_SAMPLE)
+    // Water silhouettes: when something stands between the flat water and the parallax hit of a wave trough, resolving
+    // continues past the water, and the geometry resolver decides once that surface's POM is known. See documentation/WaterSimulation.md.
+    const float waterSimRayOffset = translucentSurfaceMaterialInteraction.waterSimRayOffset;
+    const float rayUp = cb.isZUp ? ray.direction.z : ray.direction.y;
+    const bool skipWaterSilhouette = resolveVertexState.skipWaterSilhouette;
+    const float shoreRefractionLimit = -resolveVertexState.waterSurfaceDistance;
+    resolveVertexState.skipWaterSilhouette = false;
+    resolveVertexState.waterSurfaceDistance = 0.0f;
+    if ((cb.waterSimArgs.silhouetteFlags & WATER_SIM_SILHOUETTE_FLAG_WAVES) && !skipWaterSilhouette &&
+        waterSimRayOffset > cb.waterSimArgs.silhouetteMinOffset &&
+        rayUp < 0.0f && resolveVertexState.continueResolving)
+    {
+      RayDesc silhouetteRay;
+      silhouetteRay.Origin = rayOffsetSurfaceOriginHelper(surfaceInteraction, true);
+      silhouetteRay.Direction = ray.direction;
+      silhouetteRay.TMin = 0.0f;
+      silhouetteRay.TMax = waterSimRayOffset + cb.waterSimArgs.silhouettePomMargin / -rayUp;
+
+      RayQuery<RAY_FLAG_CULL_BACK_FACING_TRIANGLES | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES |
+               RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> silhouetteQuery;
+      silhouetteQuery.TraceRayInline(topLevelAS, 0,
+        resolveVertexState.rayMask & ~(OBJECT_MASK_PORTAL | OBJECT_MASK_ALPHA_BLEND), silhouetteRay);
+      while (silhouetteQuery.Proceed())
+      {
+        // Translucent surfaces such as glass stand in the way too, but not water.
+        // Alpha tested surfaces are left out, they would need the alpha test.
+        RayHitInfo candidate;
+        RAY_HIT_INFO_CREATE_RAY_QUERY_CANDIDATE(candidate, silhouetteQuery)
+        if (calculateMaterialType(candidate) == surfaceMaterialTypeTranslucent)
+        {
+          const Surface candidateSurface = surfaces[calculateSurfaceIndex(candidate)];
+          if (!candidateSurface.isAnimatedWater)
+          {
+            silhouetteQuery.CommitNonOpaqueTriangleHit();
+          }
+        }
+      }
+
+      if (silhouetteQuery.CommittedStatus() == COMMITTED_TRIANGLE_HIT)
+      {
+        resolveVertexState.waterSurfaceDistance = waterSimRayOffset;
+
+        // Note: Must call resolve final on any return which expects resolving to continue.
+        resolveVertexFinalContinue(ray, surfaceInteraction, teleport, teleportMatrix, resolveVertexState);
+
+        return 1.0f;
+      }
+    }
+
+    // The refraction starts at the simulated surface. After a shore sent resolving back here, it starts just in front of that
+    // shore's mesh at the latest, so that the refracted ray cannot start behind it.
+    surfaceInteraction.pomRayDistance = skipWaterSilhouette ? min(waterSimRayOffset, shoreRefractionLimit) : waterSimRayOffset;
+#endif
 
     // Handle translucent approximations
 
@@ -568,7 +658,7 @@ void resolveVertex<T: IBasePayloadState>(
         // Note: Must call resolve final on any return which expects resolving to continue.
         resolveVertexFinalContinue(ray, surfaceInteraction, teleport, teleportMatrix, resolveVertexState);
 
-        return;
+        return 1.0f;
       }
     }
   }
@@ -611,7 +701,7 @@ void resolveVertex<T: IBasePayloadState>(
       // Note: Must call resolve final on any return which expects resolving to continue.
       resolveVertexFinalContinue(ray, surfaceInteraction, teleport, teleportMatrix, resolveVertexState);
 
-      return;
+      return 1.0f;
     }
 
     // Find Ray Portal Hit Info
@@ -632,7 +722,7 @@ void resolveVertex<T: IBasePayloadState>(
       {
         resolveVertexFinalMiss<true>(resolveVertexState, rayInteraction, radianceAttenuation);
 
-        return;
+        return 1.0f;
       }
 
       teleportMatrix = rayPortalHitInfo.encodedPortalToOpposingPortalDirection.unpack();
@@ -663,12 +753,13 @@ void resolveVertex<T: IBasePayloadState>(
     resolveVertexFinalContinue(ray, surfaceInteraction, teleport, teleportMatrix, resolveVertexState);
 
     // Note: Continue resolving if the Ray Portal was inactive or if it was traversed.
-    return;
+    return 1.0f;
   }
 
   // Indicate resolving is finished in the absence of any need to continue
 
   resolveVertexFinalHit(resolveVertexState);
+  return 1.0f;
 }
 
 #ifndef UNORDERED_RESOLVE_WBOIT
@@ -789,7 +880,7 @@ float oitDepthWeight(float hitT, float tMax)
   return exp(-cb.wboitDepthWeightTuning * z);
 }
 
-void resolveVertexUnorderedParticles<
+float resolveVertexUnorderedParticles<
   let RAY_FLAGS : uint>(
   uint8_t resolveMode, Ray ray, uint rayMask,
   PortalSpace2BitsType portalSpace,
@@ -807,12 +898,14 @@ void resolveVertexUnorderedParticles<
 {
   surfaceIndex = -1;
 
+  float opacityTransmittance = 1.0f;
+
   const bool separateUnorderedApproximations = packedFlagGet(resolveMode, resolveModeSeparateUnorderedApproximations);
 
   if (!separateUnorderedApproximations)
   {
     numInteractions = 0;
-    return;
+    return 1.0f;
   }
 
   if (useIntersectionBillboards)
@@ -1035,6 +1128,7 @@ void resolveVertexUnorderedParticles<
     const float blendFactor = surface.isParticle ? softBlendFactor : 1.0f;
 
     currentRadianceAttenuation = mix(1.0f, currentRadianceAttenuation, blendFactor);
+    opacityTransmittance *= currentRadianceAttenuation;
     currentEmissiveRadiance = mix(vec3(0.0f), currentEmissiveRadiance, blendFactor);
 
     if (any(currentEmissiveRadiance > 0.0f))
@@ -1081,7 +1175,7 @@ void resolveVertexUnorderedParticles<
       InterlockedCompareStore(
         PrimaryObjectPicking[pixelCoordinate],
         OBJECT_PICKING_INVALID,
-        surface.objectPickingValue);
+        surfaceObjectPickingValue(surface, rayInteraction.primitiveIndex));
     }
 #endif
 #endif
@@ -1098,7 +1192,7 @@ void resolveVertexUnorderedParticles<
 
   if (numInteractions == 0)
   {
-    return;
+    return 1.0f;
   }
 
 #ifdef UNORDERED_RESOLVE_WBOIT
@@ -1132,6 +1226,7 @@ void resolveVertexUnorderedParticles<
 #endif
 
   emissiveRadiance *= 1.0f / pathSelectionProbability;
+  return opacityTransmittance;
 }
 
 // Handles unordered Resolve operations within the resolve loop which do not depend on the typical ordered execution
@@ -1153,7 +1248,7 @@ void resolveVertexUnordered<
   out uint numInteractions,
   inout bool decalEncountered,
   inout uint4 decalMemory,
-  inout vec3 decalEmissiveRadiance,
+  inout f16vec3 decalEmissiveRadiance,
   inout int surfaceIndex)
 {
   // Early out if approximations are not desired to be separated out
@@ -1349,7 +1444,18 @@ void resolveVertexUnordered<
       surfaceInteraction.vertexColor = vertexColor;
     }
 
-    const Surface surface = surfaces[uint(rayInteraction.surfaceIndex)]; 
+    const Surface surface = surfaces[uint(rayInteraction.surfaceIndex)];
+
+    const bool isDecal = isTriangle && surfaceIsDecal(surface);
+
+#ifndef RAY_TRACING_PRIMARY_RAY
+    // Back-facing opaque decals never contribute.
+    // Primary rays still create their materials, because material creation writes sampler feedback and debug views.
+    if (ENABLE_DECALS && isDecal && rayInteraction.materialType == surfaceMaterialTypeOpaque && !rayInteraction.frontHit)
+    {
+      continue;
+    }
+#endif
 
     if (isTriangle)
     {
@@ -1378,7 +1484,6 @@ void resolveVertexUnordered<
     float currentRadianceAttenuation = 1.0f;
     vec3 currentEmissiveRadiance = vec3(0.0f);
 
-    const bool isDecal = isTriangle && surfaceIsDecal(surface);
     bool handledInteraction = false;
 
     if (polymorphicType == surfaceMaterialTypeOpaque)
@@ -1424,7 +1529,7 @@ void resolveVertexUnordered<
             // use this decal
             MemoryDecalMaterialInteraction memory = decalMaterialInteractionPack(decalMaterialInteraction);
             decalMemory = memory.packed;
-            decalEmissiveRadiance = vec3(memory.emissiveRadiance);
+            decalEmissiveRadiance = memory.emissiveRadiance;
             surfaceIndex = rayInteraction.surfaceIndex;
             sampledSortOrder = decalSortKey;
             minDecalSample = rngValue;
@@ -1543,7 +1648,7 @@ void resolveVertexUnordered<
       InterlockedCompareStore(
         PrimaryObjectPicking[pixelCoordinate],
         OBJECT_PICKING_INVALID,    // compare to
-        surface.objectPickingValue // value to write, if equal
+        surfaceObjectPickingValue(surface, rayInteraction.primitiveIndex) // value to write, if equal
       );
     }
 #endif
@@ -1654,12 +1759,13 @@ void resolveVertexUnordered<
     // write it to output values
     MemoryDecalMaterialInteraction memory = decalMaterialInteractionPack(decalMaterialInteractionComposited);
     decalMemory = memory.packed;
-    decalEmissiveRadiance = vec3(memory.emissiveRadiance);
+    decalEmissiveRadiance = memory.emissiveRadiance;
   }
 #endif
 
   emissiveRadiance *= 1.0f / pathSelectionProbability;
-  decalEmissiveRadiance *= 1.0f / pathSelectionProbability;
+  // Scaled in full precision. Every reader rounds it to half precision anyway.
+  decalEmissiveRadiance = f16vec3(vec3(decalEmissiveRadiance) * (1.0f / pathSelectionProbability));
 }
 
 #if 0

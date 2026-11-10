@@ -32,9 +32,11 @@
 #include "../util/util_global_time.h"
 
 #include <rtx_shaders/particle_system_spawn.h>
+#include <rtx_shaders/particle_system_build_spawn_distribution.h>
 #include <rtx_shaders/particle_system_evolve.h>
 #include <rtx_shaders/particle_system_generate_geometry.h>
 #include "math.h"
+#include "rtx/pass/particles/particle_spawn_distribution.h"
 
 namespace dxvk {
 
@@ -52,9 +54,22 @@ namespace dxvk {
 
         STRUCTURED_BUFFER(PARTICLE_SYSTEM_BINDING_SPAWN_CONTEXT_PARTICLE_MAPPING_INPUT)
         STRUCTURED_BUFFER(PARTICLE_SYSTEM_BINDING_SPAWN_CONTEXTS_INPUT)
+        STRUCTURED_BUFFER(PARTICLE_SYSTEM_BINDING_SPAWN_DISTRIBUTION_INPUT)
         SAMPLER2D(PARTICLE_SYSTEM_BINDING_ANIMATION_DATA_INPUT)
 
         RW_STRUCTURED_BUFFER(PARTICLE_SYSTEM_BINDING_PARTICLES_BUFFER_INPUT_OUTPUT)
+        END_PARAMETER()
+    };
+
+    class ParticleSystemBuildSpawnDistribution : public ManagedShader {
+      SHADER_SOURCE(ParticleSystemBuildSpawnDistribution, VK_SHADER_STAGE_COMPUTE_BIT, particle_system_build_spawn_distribution)
+
+        BINDLESS_ENABLED()
+
+        BEGIN_PARAMETER()
+        COMMON_RAYTRACING_BINDINGS
+        CONSTANT_BUFFER(PARTICLE_SYSTEM_BINDING_CONSTANTS)
+        RW_STRUCTURED_BUFFER(PARTICLE_SYSTEM_BINDING_SPAWN_DISTRIBUTION_OUTPUT)
         END_PARAMETER()
     };
 
@@ -92,6 +107,7 @@ namespace dxvk {
         SAMPLER2D(PARTICLE_SYSTEM_BINDING_ANIMATION_DATA_INPUT)
 
         RW_STRUCTURED_BUFFER(PARTICLE_SYSTEM_BINDING_VERTEX_BUFFER_OUTPUT)
+        RW_STRUCTURED_BUFFER(PARTICLE_SYSTEM_BINDING_OBJECT_PICKING_OUTPUT)
         END_PARAMETER()
     };
   }
@@ -215,6 +231,13 @@ namespace dxvk {
           RemixGui::DragFloat("Burst Duration (s)", &spawnBurstDurationObject(), 0.1f, 0.f, 100000.f, "%.2f");
           RemixGui::Separator();
           RemixGui::Checkbox("Use Spawn Texture Coordinates", &useSpawnTexcoordsObject());
+          static auto spawnDistributionCombo = RemixGui::ComboWithKey<ParticleSpawnDistribution>(
+            "Spawn Distribution",
+            RemixGui::ComboWithKey<ParticleSpawnDistribution>::ComboEntries { {
+              {ParticleSpawnDistribution::ByTriangle, "By Triangle"},
+              {ParticleSpawnDistribution::BySurfaceArea, "By Surface Area"},
+            } });
+          spawnDistributionCombo.getKey(&spawnDistributionObject());
           RemixGui::Separator();
           RemixGui::InputFloat3("Max Velocity", &maxSpawnVelocityObject());
           RemixGui::DragFloat("Initial Velocity From Motion", &initialVelocityFromMotionObject(), 0.01f, -5000.f, 5000.f, "%.2f");
@@ -352,6 +375,7 @@ namespace dxvk {
     const RtCamera& camera = ctx->getSceneManager().getCamera();
     constants.viewToWorld = camera.getViewToWorld();
     constants.prevWorldToProjection = camera.getPreviousViewToProjection() * camera.getPreviousWorldToView();
+    constants.worldToProjection = camera.getViewToProjection() * camera.getWorldToView();
 
     constants.renderingWidth = ctx->getSceneManager().getCamera().m_renderResolution[0];
     constants.renderingHeight = ctx->getSceneManager().getCamera().m_renderResolution[1];
@@ -372,7 +396,12 @@ namespace dxvk {
 
   // Please re-profile performance if any of these structures change in size.  As a minimum performance requirement, always preserve a 16 byte alignment.
   static_assert(sizeof(GpuParticle) == 12 * 4, "Unexpected, please check perf");
+  static_assert(offsetof(GpuParticle, emitterObjectPickingValue) == 44, "Particle picking ID must reuse existing padding");
+  static_assert(sizeof(ParticleVertex) == 24, "Particle picking must not grow the vertex buffer");
+  static_assert(sizeof(GpuSpawnContext) == 144 && offsetof(GpuSpawnContext, emitterObjectPickingValue) == 128, "Spawn context layout must match shaders");
   static_assert(sizeof(GpuParticleSystemDesc) % (4 * 4) == 0, "Unexpected, please check perf");
+  static_assert(sizeof(GpuParticleSystemDesc) == 112 && offsetof(GpuParticleSystemDesc, minScreenSize) == 96, "Particle descriptor layout must match shaders");
+  static_assert(offsetof(ParticleSystemConstants, worldToProjection) == 336 && sizeof(ParticleSystemConstants) == 448, "Particle constants layout must match shaders");
 
   RtxParticleSystemDesc RtxParticleSystemManager::createGlobalParticleSystemDesc() {
     RtxParticleSystemDesc desc;
@@ -389,6 +418,7 @@ namespace dxvk {
     desc.maxNumParticles = RtxParticleSystemManager::numberOfParticlesPerMaterial();
     desc.minSpawnRotationSpeed = RtxParticleSystemManager::minSpawnRotationSpeed();
     desc.useSpawnTexcoords = RtxParticleSystemManager::useSpawnTexcoords() ? 1 : 0;
+    desc.spawnDistribution = RtxParticleSystemManager::spawnDistribution() == ParticleSpawnDistribution::BySurfaceArea;
     desc.enableCollisionDetection = RtxParticleSystemManager::enableCollisionDetection() ? 1 : 0;
     desc.alignParticlesToVelocity = RtxParticleSystemManager::alignParticlesToVelocity() ? 1 : 0;
     desc.collisionRestitution = RtxParticleSystemManager::collisionRestitution();
@@ -452,7 +482,9 @@ namespace dxvk {
       disableMaterialSpriteSheet = true;
     }
 
-    const XXH64_hash_t particleSystemHash = drawCallState.getMaterialData().getHash() ^ desc.calcHash();
+    // Game and Remix API emitters get separate systems because the particle draw inherits the emitter's isExternalDraw.
+    const XXH64_hash_t particleSystemHash = XXH3_64bits_withSeed(&drawCallState.isExternalDraw, sizeof(drawCallState.isExternalDraw),
+                                                                 drawCallState.getMaterialData().getHash() ^ desc.calcHash());
 
     auto materialSystemIt = m_particleSystems.find(particleSystemHash);
     if (materialSystemIt == m_particleSystems.end()) {
@@ -468,13 +500,14 @@ namespace dxvk {
         particleRenderMaterial.resetTextureTransform();
       }
 
-      auto pNewParticleSystem = std::make_shared<ParticleSystem>(desc, particleRenderMaterial, drawCallState.getMaterialData(), drawCallState.getCategoryFlags(), m_particleSystemCounter++);
+      auto pNewParticleSystem = std::make_shared<ParticleSystem>(desc, particleRenderMaterial, drawCallState.getMaterialData(), drawCallState.getCategoryFlags(), drawCallState.isExternalDraw, m_particleSystemCounter++);
 
       pNewParticleSystem->allocStaticBuffers(ctx);
       auto insertResult = m_particleSystems.insert({ particleSystemHash, pNewParticleSystem });
       materialSystemIt = insertResult.first;
     }
 
+    assert(materialSystemIt->second->getLookupHash() == particleSystemHash);
     (*materialSystem) = materialSystemIt->second.get();
 
     return true;
@@ -565,7 +598,7 @@ namespace dxvk {
       numParticles = getNumberOfParticlesToSpawn(particleSystem, drawCallState);
     }
 
-    if (numParticles == 0) {
+    if (numParticles == 0 || m_spawnContexts.size() > UINT16_MAX) {
       return;
     }
 
@@ -575,8 +608,10 @@ namespace dxvk {
     SpawnContext spawnCtx;
     spawnCtx.numberOfParticles = numParticles;
     spawnCtx.particleOffset = particleSystem->context.particleHeadOffset;
+    spawnCtx.particleMapOffset = uint32_t(particleSystem->spawnContextParticleMap.size());
     spawnCtx.instanceId = instanceId;
-    spawnCtx.particleSystemHash = particleSystem->getHash();
+    spawnCtx.particleSystemHash = particleSystem->getLookupHash();
+    spawnCtx.emitterObjectPickingValue = drawCallState.getParticleObjectPickingValue();
 
     // Update material specific counters
     particleSystem->context.particleHeadOffset += numParticles;
@@ -584,6 +619,9 @@ namespace dxvk {
 
     // Map the particles to a context for spawn
     particleSystem->spawnContextParticleMap.insert(particleSystem->spawnContextParticleMap.end(), spawnCtx.numberOfParticles, m_spawnContexts.size());
+    if (particleSystem->context.desc.spawnDistribution == ParticleSpawnDistribution::BySurfaceArea) {
+      particleSystem->areaSpawnContexts.push_back(uint32_t(m_spawnContexts.size()));
+    }
     assert(particleSystem->spawnContextParticleMap.size() <= particleSystem->context.desc.maxNumParticles);
 
     // Mark the time 
@@ -598,6 +636,9 @@ namespace dxvk {
       m_spawnContexts.clear();
       m_particleSystems.clear();
       m_spawnContextsBuffer = nullptr;
+      m_spawnDistributions.clear();
+      m_spawnDistributionCache.clear();
+      m_spawnDistributionConstants = nullptr;
       return;
     }
 
@@ -657,7 +698,9 @@ namespace dxvk {
         }
 
         // Finalize some constants to the GPU data
+        particleSystem.enableObjectPicking = system.second->getObjectPickingBuffer() != nullptr;
         constants.particleSystem = particleSystem;
+        constants.spawnContextMapOffset = 0;
 
         assert(particleSystem.particleCount >= particleSystem.spawnParticleCount);
 
@@ -683,15 +726,40 @@ namespace dxvk {
 
         // Handle spawning
         if (particleSystem.spawnParticleCount > 0) {
-          const VkExtent3D workgroups = util::computeBlockCount(VkExtent3D { particleSystem.spawnParticleCount, 1, 1 }, VkExtent3D { 128, 1, 1 });
-
           ctx->bindResourceBuffer(PARTICLE_SYSTEM_BINDING_SPAWN_CONTEXTS_INPUT, DxvkBufferSlice(m_spawnContextsBuffer));
           ctx->bindResourceBuffer(PARTICLE_SYSTEM_BINDING_SPAWN_CONTEXT_PARTICLE_MAPPING_INPUT, DxvkBufferSlice(system.second->getSpawnContextMappingBuffer()));
           ctx->bindResourceBuffer(PARTICLE_SYSTEM_BINDING_PARTICLES_BUFFER_INPUT_OUTPUT, DxvkBufferSlice(system.second->getParticlesBuffer()));
 
           ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, ParticleSystemSpawn::getShader());
-
-          ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
+          if (particleSystem.desc.spawnDistribution == ParticleSpawnDistribution::BySurfaceArea) {
+            ScopedGpuProfileZone(ctx, "Rtx Particle Surface Area Spawn");
+            for (uint32_t contextIdx : system.second->areaSpawnContexts) {
+              assert(contextIdx < m_spawnDistributions.size());
+              const SpawnContext& spawn = m_spawnContexts[contextIdx];
+              constants.particleSystem.spawnParticleCount = spawn.numberOfParticles;
+              constants.particleSystem.spawnParticleOffset = spawn.particleOffset;
+              constants.spawnContextMapOffset = spawn.particleMapOffset;
+              const DxvkBufferSliceHandle spawnSlice = m_cb->allocSlice();
+              ctx->invalidateBuffer(m_cb, spawnSlice);
+              ctx->writeToBuffer(m_cb, 0, sizeof(constants), &constants);
+              ctx->bindResourceBuffer(PARTICLE_SYSTEM_BINDING_CONSTANTS, DxvkBufferSlice(m_cb));
+              const Rc<DxvkBuffer>& distribution = m_spawnDistributions[contextIdx] != nullptr
+                ? m_spawnDistributions[contextIdx] : m_spawnContextsBuffer;
+              ctx->bindResourceBuffer(PARTICLE_SYSTEM_BINDING_SPAWN_DISTRIBUTION_INPUT, DxvkBufferSlice(distribution));
+              const VkExtent3D groups = util::computeBlockCount(VkExtent3D { spawn.numberOfParticles, 1, 1 }, VkExtent3D { 128, 1, 1 });
+              ctx->dispatch(groups.width, groups.height, groups.depth);
+            }
+            constants.particleSystem = particleSystem;
+            constants.spawnContextMapOffset = 0;
+            const DxvkBufferSliceHandle restoreSlice = m_cb->allocSlice();
+            ctx->invalidateBuffer(m_cb, restoreSlice);
+            ctx->writeToBuffer(m_cb, 0, sizeof(constants), &constants);
+            ctx->bindResourceBuffer(PARTICLE_SYSTEM_BINDING_CONSTANTS, DxvkBufferSlice(m_cb));
+          } else {
+            ctx->bindResourceBuffer(PARTICLE_SYSTEM_BINDING_SPAWN_DISTRIBUTION_INPUT, DxvkBufferSlice(m_spawnContextsBuffer));
+            const VkExtent3D groups = util::computeBlockCount(VkExtent3D { particleSystem.spawnParticleCount, 1, 1 }, VkExtent3D { 128, 1, 1 });
+            ctx->dispatch(groups.width, groups.height, groups.depth);
+          }
         }
 
         // Handle simulation updates
@@ -712,6 +780,9 @@ namespace dxvk {
 
           ctx->bindResourceBuffer(PARTICLE_SYSTEM_BINDING_PARTICLES_BUFFER_INPUT, DxvkBufferSlice(system.second->getParticlesBuffer()));
           ctx->bindResourceBuffer(PARTICLE_SYSTEM_BINDING_VERTEX_BUFFER_OUTPUT, DxvkBufferSlice(system.second->getVertexBuffer()));
+          const auto& pickingBuffer = system.second->getObjectPickingBuffer();
+          ctx->bindResourceBuffer(PARTICLE_SYSTEM_BINDING_OBJECT_PICKING_OUTPUT,
+            pickingBuffer != nullptr ? DxvkBufferSlice(pickingBuffer) : DxvkBufferSlice());
 
           ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, ParticleSystemGenerateGeometry::getShader());
 
@@ -788,6 +859,13 @@ namespace dxvk {
     }
 
     const uint32_t currentFrameId = ctx->getDevice()->getCurrentFrameId();
+    m_spawnDistributions.clear();
+    const bool hasAreaSpawns = std::any_of(m_particleSystems.begin(), m_particleSystems.end(), [](const auto& system) {
+      return !system.second->areaSpawnContexts.empty();
+    });
+    if (hasAreaSpawns) {
+      m_spawnDistributions.resize(m_spawnContexts.size());
+    }
 
     // Align the data
     std::vector<GpuSpawnContext> gpuSpawnContexts(m_spawnContexts.size());
@@ -799,15 +877,9 @@ namespace dxvk {
       const RtInstance* pTargetInstance = spawnCtx.instanceId < ctx->getSceneManager().getInstanceTable().size() ? ctx->getSceneManager().getInstanceTable()[spawnCtx.instanceId] : nullptr;
 
       if (pTargetInstance == nullptr) {
-        // I dont see this case being hit, but in theory it could happen since we track the 
-        //   instance ID at draw time, and the instance list can change over the course of a frame.
-        //   In the event it does happen, handle gracefully...dw
+        // Reserved births must stay in sync with the ring head and spawn-context mapping.
+        // A zero-triangle context creates invisible particles that expire normally.
         memset(&gpuCtx, 0, sizeof(GpuSpawnContext));
-        // zero out the spawn count, so we dont try to create any new particles here
-        auto particleSystemIt = m_particleSystems.find(spawnCtx.particleSystemHash);
-        if (particleSystemIt != m_particleSystems.end()) {
-          particleSystemIt->second->context.spawnParticleCount = 0;
-        }
         continue;
       }
 
@@ -831,6 +903,15 @@ namespace dxvk {
       gpuCtx.spawnMeshColorsStride = pTargetInstance->surface.color0Stride;
       gpuCtx.spawnMeshTexcoordsOffset = pTargetInstance->surface.texcoordOffset;
       gpuCtx.spawnMeshTexcoordsStride = pTargetInstance->surface.texcoordStride;
+
+      const auto system = m_particleSystems.find(spawnCtx.particleSystemHash);
+      if (system != m_particleSystems.end() && system->second->context.desc.spawnDistribution == ParticleSpawnDistribution::BySurfaceArea) {
+        m_spawnDistributions[contextIdx] = prepareSpawnDistribution(ctx, *pTargetInstance, gpuCtx);
+        if (m_spawnDistributions[contextIdx] == nullptr) {
+          gpuCtx.numTriangles = 0;
+        }
+      }
+      gpuCtx.emitterObjectPickingValue = spawnCtx.emitterObjectPickingValue;
     }
 
     // Send data to GPU
@@ -849,14 +930,90 @@ namespace dxvk {
     }
   }
 
+  Rc<DxvkBuffer> RtxParticleSystemManager::prepareSpawnDistribution(RtxContext* ctx, const RtInstance& instance, const GpuSpawnContext& spawnContext) {
+    const uint32_t frame = ctx->getDevice()->getCurrentFrameId();
+    const BlasEntry& geometry = *instance.getBlas();
+    SpawnDistribution& cached = m_spawnDistributionCache[instance.getCacheIdentity()];
+    cached.frameLastUsed = frame;
+    VkDescriptorBufferInfo positions = geometry.modifiedGeometryData.positionBuffer.getDescriptor().buffer;
+    VkDescriptorBufferInfo indices = geometry.modifiedGeometryData.indexBuffer.getDescriptor().buffer;
+    positions.offset += geometry.modifiedGeometryData.positionBuffer.offsetFromSlice();
+    indices.offset += geometry.modifiedGeometryData.indexBuffer.offsetFromSlice();
+    const ParticleSpawnAreaMetric metric = particleSpawnAreaMetric(instance.getTransform());
+    if (cached.buffer != nullptr && cached.geometry == &geometry
+        && cached.geometryCreated == geometry.frameCreated && cached.geometryUpdated == geometry.frameLastUpdated
+        && cached.triangleCount == spawnContext.numTriangles
+        && cached.positionOffset == spawnContext.spawnMeshPositionsOffset
+        && cached.positionStride == spawnContext.spawnMeshPositionsStride && cached.indices32bit == spawnContext.indices32bit
+        && cached.positions.buffer == positions.buffer && cached.positions.offset == positions.offset
+        && cached.indices.buffer == indices.buffer && cached.indices.offset == indices.offset
+        && canReuseParticleSpawnAreas(cached.metric, metric)) {
+      return cached.buffer;
+    }
+
+    const uint32_t blockCount = particleDistributionBlockCount(spawnContext.numTriangles);
+    const VkDeviceSize bytes = (2 * VkDeviceSize(spawnContext.numTriangles) + blockCount + 1) * sizeof(float);
+    const auto& limits = ctx->getDevice()->properties().core.properties.limits;
+    if (spawnContext.numTriangles == 0 || bytes > limits.maxStorageBufferRange || blockCount > limits.maxComputeWorkGroupCount[0]) {
+      cached.buffer = nullptr;
+      return nullptr;
+    }
+
+    ScopedGpuProfileZone(ctx, "Rtx Particle Area Distribution");
+    if (cached.buffer == nullptr || cached.buffer->info().size != bytes) {
+      DxvkBufferCreateInfo info;
+      info.size = bytes;
+      info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+      info.stages = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+      info.access = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+      cached.buffer = ctx->getDevice()->createBuffer(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                                                    DxvkMemoryStats::Category::RTXBuffer, "RTX Particles - Spawn Area Distribution");
+    }
+    if (m_spawnDistributionConstants == nullptr) {
+      DxvkBufferCreateInfo info;
+      info.size = sizeof(ParticleSpawnDistributionConstants);
+      info.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+      info.stages = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+      info.access = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_UNIFORM_READ_BIT;
+      m_spawnDistributionConstants = ctx->getDevice()->createBuffer(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+        DxvkMemoryStats::Category::RTXBuffer, "RTX Particles - Spawn Area Constants");
+    }
+    ParticleSpawnDistributionConstants constants = {};
+    constants.spawnContext = spawnContext;
+    constants.spawnContext.spawnObjectToWorld = mat4x3(particleSpawnAreaTransform(instance.getTransform()));
+    ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, ParticleSystemBuildSpawnDistribution::getShader());
+    ctx->bindResourceBuffer(PARTICLE_SYSTEM_BINDING_SPAWN_DISTRIBUTION_OUTPUT, DxvkBufferSlice(cached.buffer));
+    for (uint32_t pass = 0; pass < kParticleDistributionPassCount; pass++) {
+      constants.pass = pass;
+      const DxvkBufferSliceHandle slice = m_spawnDistributionConstants->allocSlice();
+      ctx->invalidateBuffer(m_spawnDistributionConstants, slice);
+      ctx->writeToBuffer(m_spawnDistributionConstants, 0, sizeof(constants), &constants);
+      ctx->bindResourceBuffer(PARTICLE_SYSTEM_BINDING_CONSTANTS, DxvkBufferSlice(m_spawnDistributionConstants));
+      ctx->dispatch(pass == kParticleDistributionMeasure || pass == kParticleDistributionBuild ? blockCount : 1, 1, 1);
+    }
+    cached.geometry = &geometry;
+    cached.geometryCreated = geometry.frameCreated;
+    cached.geometryUpdated = geometry.frameLastUpdated;
+    cached.triangleCount = spawnContext.numTriangles;
+    cached.positionOffset = spawnContext.spawnMeshPositionsOffset;
+    cached.positionStride = spawnContext.spawnMeshPositionsStride;
+    cached.indices32bit = spawnContext.indices32bit;
+    cached.positions = positions;
+    cached.indices = indices;
+    cached.metric = metric;
+    return cached.buffer;
+  }
+
   void RtxParticleSystemManager::submitDrawState(RtxContext* ctx) const {
     ScopedCpuProfileZone();
     if (!enable() || !m_initialized) {
       return;
     }
 
+    const bool pickingEnabled = ctx->getResourceManager().getRaytracingOutput().m_primaryObjectPicking.isValid();
     for (const auto& keyPair : m_particleSystems) {
-      const ParticleSystem& particleSystem = *(keyPair.second.get());
+      ParticleSystem& particleSystem = *(keyPair.second.get());
+      particleSystem.prepareObjectPickingBuffer(ctx, pickingEnabled);
 
       // Here we create a fake draw call, and send it through the regular scene manager pipeline
       //   which has the advantage of supporting replacement materials.
@@ -883,6 +1040,10 @@ namespace dxvk {
       particleGeometry.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
       particleGeometry.cullMode = VK_CULL_MODE_NONE;
       particleGeometry.frontFace = VK_FRONT_FACE_CLOCKWISE;
+      if (particleSystem.getObjectPickingBuffer() != nullptr) {
+        particleGeometry.particlePickingBuffer = RasterBuffer(DxvkBufferSlice(particleSystem.getObjectPickingBuffer()), 0, sizeof(uint32_t), VK_FORMAT_R32_UINT);
+        particleGeometry.particlePickingPrimitivesPerParticle = particleSystem.getIndicesPerParticle() / 3;
+      }
       particleGeometry.hashes[HashComponents::Indices] = particleHashConstant ^ particleSystem.getGeneration();
       particleGeometry.hashes[HashComponents::VertexPosition] = particleHashConstant ^ particleSystem.getGeneration();
       particleGeometry.hashes.precombine();
@@ -895,9 +1056,12 @@ namespace dxvk {
       newDrawCallState.modifyCategoryFlags().set(InstanceCategories::Particle); // ?
       newDrawCallState.modifyCategoryFlags().clr(InstanceCategories::ParticleEmitter);
       newDrawCallState.modifyCategoryFlags().clr(InstanceCategories::Hidden);
+      // Generated billboard normals come from their triangles.
+      newDrawCallState.modifyCategoryFlags().clr(InstanceCategories::SmoothNormals);
       newDrawCallState.modifyTransformData().viewToProjection = camera.getViewToProjection();
       newDrawCallState.modifyTransformData().worldToView = camera.getWorldToView();
       newDrawCallState.modifyMaterialData() = particleSystem.legacyMaterialData;
+      newDrawCallState.isExternalDraw = particleSystem.isExternalDraw;
 
       // We want to always have particles support vertex colour for now.
       newDrawCallState.modifyMaterialData().textureColorArg1Source = RtTextureArgSource::Texture;
@@ -912,16 +1076,20 @@ namespace dxvk {
     }
   }
 
-  RtxParticleSystemManager::ParticleSystem::ParticleSystem(const RtxParticleSystemDesc& desc, const MaterialData& matData, const LegacyMaterialData& legacyMatData, const CategoryFlags& cats, const uint32_t seed) : context(desc)
+  RtxParticleSystemManager::ParticleSystem::ParticleSystem(const RtxParticleSystemDesc& desc, const MaterialData& matData, const LegacyMaterialData& legacyMatData, const CategoryFlags& cats, const bool isExternal, const uint32_t seed)
+    : m_lookupHash(XXH3_64bits_withSeed(&isExternal, sizeof(isExternal), legacyMatData.getHash() ^ desc.calcHash()))
+    , context(desc)
     , materialData(matData)
     , legacyMaterialData(legacyMatData)
     , categories(cats)
+    , isExternalDraw(isExternal)
     , lastSpawnTimeMs(GlobalTime::get().absoluteTimeMs()) {
     // Seed the RNG with a parameter from the manager, so we get unique random values for each particle system
     generator = std::default_random_engine(seed);
     // Store this hash since it cannot change now.
     // NOTE: This material data hash is stable within a run, but since hash depends on VK handles, it is not reliable across runs.
-    m_cachedHash = materialData.getHash() ^ desc.calcHash();
+    // Game and API systems get distinct rendering identities; m_lookupHash separately retains the original material.
+    m_cachedHash = XXH3_64bits_withSeed(&isExternalDraw, sizeof(isExternalDraw), materialData.getHash() ^ desc.calcHash());
     context.numVerticesPerParticle = getVerticesPerParticle();
 
     // Copy CPU-only animation data from RtxParticleSystemDesc
@@ -963,6 +1131,23 @@ namespace dxvk {
     }
 
 
+  }
+
+  void RtxParticleSystemManager::ParticleSystem::prepareObjectPickingBuffer(DxvkContext* pCtx, bool enabled) {
+    if (!enabled) {
+      m_objectPicking = nullptr;
+      return;
+    }
+
+    const VkDeviceSize size = sizeof(uint32_t) * context.desc.maxNumParticles;
+    if (m_objectPicking == nullptr || m_objectPicking->info().size != size) {
+      DxvkBufferCreateInfo info;
+      info.size = size;
+      info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+      info.stages = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR;
+      info.access = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
+      m_objectPicking = pCtx->getDevice()->createBuffer(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, DxvkMemoryStats::Category::RTXBuffer, "RTX Particles - Object Picking Buffer");
+    }
   }
 
   void RtxParticleSystemManager::ParticleSystem::allocStaticBuffers(DxvkContext* ctx) {
@@ -1146,6 +1331,38 @@ namespace dxvk {
   void RtxParticleSystemManager::prepareForNextFrame() {
     // Spawn contexts dont persist across frames, this is because we want to support objects with unstable hashes.
     m_spawnContexts.clear();
+    m_spawnDistributions.clear();
+    const uint32_t frame = m_device->getCurrentFrameId();
+    VkDeviceSize cachedBytes = 0;
+    for (auto entry = m_spawnDistributionCache.begin(); entry != m_spawnDistributionCache.end();) {
+      if (frame - entry->second.frameLastUsed > 300) {
+        entry = m_spawnDistributionCache.erase(entry);
+      } else {
+        if (entry->second.buffer != nullptr) {
+          cachedBytes += entry->second.buffer->info().size;
+        }
+        ++entry;
+      }
+    }
+    constexpr VkDeviceSize kSpawnDistributionCacheBudget = 64ull * 1024 * 1024;
+    if (cachedBytes > kSpawnDistributionCacheBudget) {
+      std::vector<std::pair<uint32_t, uint64_t>> oldest;
+      oldest.reserve(m_spawnDistributionCache.size());
+      for (const auto& entry : m_spawnDistributionCache) {
+        oldest.emplace_back(frame - entry.second.frameLastUsed, entry.first);
+      }
+      std::sort(oldest.rbegin(), oldest.rend());
+      for (const auto& entry : oldest) {
+        auto cached = m_spawnDistributionCache.find(entry.second);
+        if (cached->second.buffer != nullptr) {
+          cachedBytes -= cached->second.buffer->info().size;
+        }
+        m_spawnDistributionCache.erase(cached);
+        if (cachedBytes <= kSpawnDistributionCacheBudget) {
+          break;
+        }
+      }
+    }
 
     // Signals which version of the vertex data we are on due to simulation
 
@@ -1171,6 +1388,7 @@ namespace dxvk {
       }
 
       particleSystem.spawnContextParticleMap.clear();
+      particleSystem.areaSpawnContexts.clear();
 
       ++keyPairIt;
     }

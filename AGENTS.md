@@ -50,6 +50,7 @@ Full guide: `documentation/CONTRIBUTING-style-guide.md`
   - Macros and defines: `UPPER_CASE`
   - Classes and structs: `PascalCase`
 - **Conditions**: 
+  - Prefer direct comparisons and positive predicates when they make a condition easier to read. For example, prefer `any(uv < 0.0f)` over `!all(uv >= 0.0f)` when equivalent. Preserve floating-point edge-case handling, including explicit NaN rejection when needed.
   - Test an integer flag by referencing the variable on its own, `if (flag)`, not `if (flag != 0)`. Applies to C++ and Slang, including `uint` flags in constant buffers. Bit tests like `(flags & kSomeBit) != 0` are unaffected.
   - When setting a `uint` flag in a shader constant buffer argument struct from a `bool`, assign it directly, `args.flag = enable;`, not `args.flag = enable ? 1u : 0u;`.
   - Put subjects first. Good: `if (pData == nullptr)`, Bad: `if (nullptr == pData)`.
@@ -69,9 +70,12 @@ Full guide: `documentation/CONTRIBUTING-style-guide.md`
   - Focus on recording non-obvious interactions and pitfalls.
   - Keep material parameter documentation in MDL. Reserve code comments about material parameters for implementation details.
   - If a long plain-english explanation of how a complicated set of systems interact is needed, that should go in a .md file in the `documentation/` folder.
-    - Documentation about how to use a feature should be clearly separated from technical documenation about how a feature works.
     - In code comments should reference sections of that .md file, rather than repeating or trying to summarize.
   - Rational for why a change is needed should go into commit messages or MR descriptions, not the code.
+- **Documentation**:
+  - .md files in the `documentation/` folder should have two clear focuses:
+    - What modders need to know to use the system in question.  This section should be concise and human readable.
+    - What agents and developers need to know to properly debug, fix, and extend the system.  This may include architecture design explanations, how the system works technically, how it interacts with other systems, and info on how to avoid re-introducing bugs.
 
 ### Changes to Upstream-Derived DXVK Code
 
@@ -98,6 +102,10 @@ See [the full rule](documentation/CONTRIBUTING-style-guide.md#changes-to-upstrea
 - Always use REMIXAPI macro for Remix exported functions, do NOT use DLLEXPORT macro.
 - Always use REMIXAPI_CALL macro for calling convention for exported function.
 - Always add new export function shims to d3d9_rtx_shim.cpp for correct shimming on WoA.
+
+### Changing the Remix API
+
+- Follow the rules in the Extensibility section of `documentation/RemixSDK.md` for every change to `public/include/remix/remix_c.h`: bump `REMIXAPI_VERSION_PATCH`, only append interface pointers and struct fields, ensure a zero-initialized new field leaves behavior unchanged, and add a changelog entry.
 
 ## RTX Options
 
@@ -145,6 +153,7 @@ When modifying shared headers, ensure both C++ and Slang code paths remain consi
 
 ### Slang Conventions
 
+- Put opening braces on the next line for shader functions, conditionals and loops, including single-statement bodies. The same-line brace rule above applies to C++ only.
 - Declare only one variable per declaration.
 - `mat4x3` for 3x4 matrices (3 rows of 4 columns, row-major in Slang).
 - `f16vec3` / `float16_t` for half-precision where appropriate.
@@ -162,7 +171,7 @@ When modifying shared headers, ensure both C++ and Slang code paths remain consi
 
 - Squash into a single commit before submitting.
 - Limit changes to those required for the PR goal — no drive-by style fixes.
-- Add your name to `src/dxvk/imgui/dxvk_imgui_about.cpp` under "GitHub Contributors" (A-Z by last name).
+- Credit contributors in `src/dxvk/imgui/dxvk_imgui_about.cpp` under the appropriate category (A-Z by last name). NVIDIA employees belong in their respective category, such as "Engineering", "Art", or "Production", not "Github Contributors". Check existing credits before adding a name to avoid duplicates.
 
 
 ## Key Directories

@@ -33,6 +33,7 @@
 
 #include <inttypes.h>
 #include <memory>
+#include <optional>
 #include <vector>
 #include <unordered_set>
 #include <future>
@@ -333,6 +334,8 @@ struct RaytraceGeometry {
   RaytraceBuffer texcoordBuffer;
   RaytraceBuffer color0Buffer;
   RaytraceBuffer indexBuffer;
+  RaytraceBuffer particlePickingBuffer;
+  uint16_t particlePickingPrimitivesPerParticle = 0;
 
   uint32_t positionBufferIndex = kSurfaceInvalidBufferIndex;
   uint32_t previousPositionBufferIndex = kSurfaceInvalidBufferIndex;
@@ -340,6 +343,7 @@ struct RaytraceGeometry {
   uint32_t texcoordBufferIndex = kSurfaceInvalidBufferIndex;
   uint32_t color0BufferIndex = kSurfaceInvalidBufferIndex;
   uint32_t indexBufferIndex = kSurfaceInvalidBufferIndex;
+  uint32_t particlePickingBufferIndex = kSurfaceInvalidBufferIndex;
 
   Rc<DxvkBuffer> historyBuffer[2] = {nullptr};
   Rc<DxvkBuffer> indexCacheBuffer = nullptr;
@@ -379,6 +383,10 @@ struct RasterGeometry {
 
   // Used by replacements mostly, to force the cull bit to that set by the geometry data
   bool forceCullBit = false;
+
+  // One emitter picking ID per generated particle, in triangle draw order.
+  RasterBuffer particlePickingBuffer;
+  uint16_t particlePickingPrimitivesPerParticle = 0;
 
   RasterBuffer positionBuffer;
   RasterBuffer normalBuffer;
@@ -653,11 +661,59 @@ enum class InstanceCategories : uint32_t {
   ParticleEmitter,
   SmoothNormals,
   HairCards,
+  Sludge,
 
   Count,
 };
 
 using CategoryFlags = Flags<InstanceCategories>;
+
+// A capture saves a category as TRUE, FALSE or EMPTY (no override, nothing written into a capture).
+// This function checks if we need to explicitly save 'FALSE' when the instance category is not set in a mask.
+// Otherwise, it's saved as 'EMPTY'.
+inline bool isCategoryCapturedWhenFalse(InstanceCategories category) {
+  #ifdef _MSC_VER
+    #pragma warning(push)
+    #pragma warning(error: 4062) // compile error if enum is not explicitly handled
+  #endif
+  switch (category) {
+  case InstanceCategories::WorldUI:
+  case InstanceCategories::WorldMatte:
+  case InstanceCategories::Sky:
+  case InstanceCategories::Ignore:
+  case InstanceCategories::IgnoreLights:
+  case InstanceCategories::IgnoreAntiCulling:
+  case InstanceCategories::IgnoreMotionBlur:
+  case InstanceCategories::IgnoreOpacityMicromap:
+  case InstanceCategories::IgnoreAlphaChannel:
+  case InstanceCategories::Hidden:
+  case InstanceCategories::Particle:
+  case InstanceCategories::Beam:
+  case InstanceCategories::DecalStatic:
+  case InstanceCategories::DecalDynamic:
+  case InstanceCategories::DecalSingleOffset:
+  case InstanceCategories::DecalNoOffset:
+  case InstanceCategories::AlphaBlendToCutout:
+  case InstanceCategories::Terrain:
+  case InstanceCategories::AnimatedWater:
+  case InstanceCategories::ThirdPersonPlayerModel:
+  case InstanceCategories::ThirdPersonPlayerBody:
+  case InstanceCategories::IgnoreBakedLighting:
+  case InstanceCategories::ParticleEmitter:
+  case InstanceCategories::SmoothNormals:
+    return true; // Category is saved as 'FALSE' if not set
+  case InstanceCategories::HairCards:
+  case InstanceCategories::Sludge:
+  case InstanceCategories::Count:
+    return false; // Category is saved as 'EMPTY' if not set. Add new categories here, so existing captures stay unchanged.
+  }
+  assert( 0 && "isCategoryCapturedWhenFalse: invalid category value" );
+  return false;
+  #ifdef _MSC_VER
+    #pragma warning(pop)
+  #endif
+}
+
 
 #define DECAL_CATEGORY_FLAGS InstanceCategories::DecalStatic, InstanceCategories::DecalDynamic, InstanceCategories::DecalSingleOffset, InstanceCategories::DecalNoOffset
 
@@ -705,6 +761,11 @@ struct DrawCallState {
     return skinningData;
   }
 
+  // Refreshes cached bone matrices only. Geometry, material and hash fields must stay stable for pairing.
+  SkinningData& getSkinningStateMutable() {
+    return skinningData;
+  }
+
   const FogState& getFogState() const {
     return fogState;
   }
@@ -747,9 +808,52 @@ struct DrawCallState {
   bool zEnable = false;
 
   uint32_t drawCallID = 0;
+  std::optional<uint32_t> particleObjectPickingValue;
+
+  uint32_t getParticleObjectPickingValue() const {
+    return particleObjectPickingValue.value_or(drawCallID);
+  }
+
+  // Set for draws submitted through the Remix API rather than by the game.
+  bool isExternalDraw = false;
 
   bool isDrawingToRaytracedRenderTarget = false;
   bool isUsingRaytracedRenderTarget = false;
+
+  void setRaytracedRenderTarget(const Rc<DxvkImage>& pImage) {
+    raytracedRenderTargetImage = pImage;
+    raytracedRenderTargetDescriptorHash = pImage != nullptr ? pImage->getDescriptorHash() : kEmptyHash;
+    isUsingRaytracedRenderTarget = pImage != nullptr;
+  }
+
+  XXH64_hash_t getCapturedMaterialHash(XXH64_hash_t legacyMaterialHash) const {
+    return isUsingRaytracedRenderTarget && raytracedRenderTargetDescriptorHash != kEmptyHash
+      ? raytracedRenderTargetDescriptorHash : legacyMaterialHash;
+  }
+
+  template<typename LookupMaterial>
+  std::shared_ptr<MaterialData> findMaterialReplacement(LookupMaterial&& lookupMaterial) const {
+    auto pMaterial = lookupMaterial(getMaterialData().getHash());
+    if (pMaterial == nullptr && isUsingRaytracedRenderTarget && raytracedRenderTargetDescriptorHash != kEmptyHash) {
+      pMaterial = lookupMaterial(raytracedRenderTargetDescriptorHash);
+    }
+    return pMaterial;
+  }
+
+  bool isCameraMaterialDirty(const std::unordered_set<XXH64_hash_t>& dirtyMaterialHashes) const {
+    return isUsingRaytracedRenderTarget && raytracedRenderTargetDescriptorHash != kEmptyHash &&
+      dirtyMaterialHashes.count(raytracedRenderTargetDescriptorHash) != 0;
+  }
+
+  bool isRaytracedRenderTargetTexture(const TextureRef& texture) const {
+    const auto* pImageView = texture.getImageView();
+    return isUsingRaytracedRenderTarget && raytracedRenderTargetImage != nullptr &&
+      pImageView != nullptr && pImageView->image() == raytracedRenderTargetImage;
+  }
+
+  // Retain the categorized resource independently of the primary albedo/opacity input.
+  Rc<DxvkImage> raytracedRenderTargetImage;
+  XXH64_hash_t raytracedRenderTargetDescriptorHash = kEmptyHash;
 
   // Set when the Sky category was assigned by skyAutoDetect heuristic
   // (as opposed to explicit methods like skyBoxTextures/skyBoxGeometries/skyMinZThreshold).
@@ -882,6 +986,8 @@ struct PooledBlas : public RcObject {
   // Hash of a bound opacity micromap
   // Note: only used for tracking of OMMs for static BLASes
   XXH64_hash_t opacityMicromapSourceHash = kEmptyHash;
+  // Attachment presence from the actual last build, including dynamic BLASes returned to the pool.
+  bool hasOmmAttachments = false;
 
   // Keep a copy of the build info so we can validate BLAS update compatibility
   VkAccelerationStructureBuildGeometryInfoKHR buildInfo = {};

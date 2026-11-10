@@ -773,13 +773,17 @@ vec4 compositeResult(
   vec3 secondarySpecularAlbedo = vec3(0);
   if (geometryFlags.secondarySurfaceMask)
   {
-    secondaryAttenuation = r11g11b10ToColor(imageLoad(SecondaryAttenuation, ivec2(compactedCoordinate)));
+    // NV-DXVK start: Preserve emissive camera gain in composite.
+    secondaryAttenuation = unpackAttenuation(imageLoad(SecondaryAttenuation, ivec2(compactedCoordinate)));
+    // NV-DXVK end
     secondaryAlbedo = SecondaryAlbedo[compactedCoordinate].xyz;
     secondarySpecularAlbedo = SecondarySpecularAlbedo[compactedCoordinate].xyz;
   }
   if (pixelIsActive)
   {
-    primaryAttenuation = r11g11b10ToColor(PrimaryAttenuation[compactedCoordinate]);
+    // NV-DXVK start: Preserve emissive camera gain in composite.
+    primaryAttenuation = unpackAttenuation(PrimaryAttenuation[compactedCoordinate]);
+    // NV-DXVK end
     primaryAlbedo = PrimaryAlbedo[compactedCoordinate].xyz;
     primarySpecularAlbedo = PrimarySpecularAlbedo[compactedCoordinate].xyz;
     perceptualRoughness = PrimaryVirtualWorldNormalPerceptualRoughness[compactedCoordinate].w;
@@ -849,6 +853,10 @@ vec4 compositeResult(
   const float fogTransmittance = applyFog(viewDistance, radianceScale, radianceOutput, primaryMiss, worldY, worldPosition, primaryRayDirections, pixelCoordinate);
   controlMaskTransmittance = calcBt709Luminance(saturate(controlMaskVolumeAttenuation));
   controlMaskTransmittance *= fogTransmittance * backgroundAlpha;
+
+  if (cb.enableCoverageAov != 0) {
+    PrimaryCoverage[pixelCoordinate] = saturate(1.0f - PrimaryCoverage[pixelCoordinate] * backgroundAlpha);
+  }
 
   // Combine the alpha-blended foreground with the background before upscaling.
   return vec4(radianceOutput * backgroundAlpha + alphaBlendOutput, 1.f);

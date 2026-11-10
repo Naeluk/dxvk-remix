@@ -41,6 +41,7 @@
 #include "../dxvk_image.h"
 
 #include "../../util/util_math.h"
+#include "../../util/util_remix_api_version.h"
 #include "../../util/util_vector.h"
 #include "../../util/util_string.h"
 #include "../../util/util_sentry.h"
@@ -49,6 +50,8 @@
 
 #include <windows.h>
 
+#include <cmath>
+#include <cstring>
 #include <optional>
 
 namespace dxvk {
@@ -695,8 +698,9 @@ namespace {
       if (flags & REMIXAPI_INSTANCE_CATEGORY_BIT_PARTICLE_EMITTER)         { result.set(InstanceCategories::ParticleEmitter); }
       if (flags & REMIXAPI_INSTANCE_CATEGORY_BIT_SMOOTH_NORMALS)            { result.set(InstanceCategories::SmoothNormals); }
       if (flags & REMIXAPI_INSTANCE_CATEGORY_BIT_HAIR_CARDS)                { result.set(InstanceCategories::HairCards); }
+      if (flags & REMIXAPI_INSTANCE_CATEGORY_BIT_SLUDGE)                    { result.set(InstanceCategories::Sludge); }
       
-      static_assert((int)InstanceCategories::Count == 25, "Instance categories changed, please update Remix SDK");
+      static_assert((int)InstanceCategories::Count == 26, "Instance categories changed, please update Remix SDK");
       return result;
     }
 
@@ -829,6 +833,9 @@ std::unique_ptr<dxvk::ExternalDrawState> dxvk::RemixAPIPrivateAccessor::toRtDraw
   if (auto objectPicking = pnext::find<remixapi_InstanceInfoObjectPickingEXT>(&info)) {
     prototype.drawCallID = objectPicking->objectPickingValue;
   }
+  if (auto particlePicking = pnext::find<remixapi_InstanceInfoParticleObjectPickingEXT>(&info)) {
+    prototype.particleObjectPickingValue = particlePicking->objectPickingValue;
+  }
 
   if (auto extBones = pnext::find<remixapi_InstanceInfoBoneTransformsEXT>(&info)) {
     const uint32_t boneCount =
@@ -872,6 +879,19 @@ std::unique_ptr<dxvk::ExternalDrawState> dxvk::RemixAPIPrivateAccessor::toRtDraw
   }
   if (auto extParticles = pnext::find<remixapi_InstanceInfoParticleSystemLegacyEXT>(&info)) {
     state->optionalParticleDesc.emplace(convert::toRtParticleDesc(*extParticles));
+  }
+  if (auto distribution = pnext::find<remixapi_InstanceInfoParticleSpawnDistributionEXT>(&info)) {
+    if (state->optionalParticleDesc) {
+      state->optionalParticleDesc->spawnDistribution = distribution->spawnDistribution == REMIXAPI_PARTICLE_SPAWN_DISTRIBUTION_BY_SURFACE_AREA;
+    }
+  }
+
+  if (auto screenSize = pnext::find<remixapi_InstanceInfoParticleScreenSizeEXT>(&info)) {
+    if (state->optionalParticleDesc) {
+      state->optionalParticleDesc->minScreenSize = screenSize->minScreenSize;
+      state->optionalParticleDesc->maxScreenSize = screenSize->maxScreenSize;
+      state->optionalParticleDesc->screenSizeCoverage = screenSize->screenSizeCoverage;
+    }
   }
 
   if (auto extInstancing = pnext::find<remixapi_InstanceInfoGpuInstancingEXT>(&info)) {
@@ -1018,8 +1038,11 @@ namespace {
     dst.color0Buffer = dxvk::RasterBuffer { vertexSlice, offsetof(remixapi_HardcodedVertex, color), sizeof(remixapi_HardcodedVertex), VK_FORMAT_B8G8R8A8_UNORM };
     if (src.skinning_hasvalue) {
       dst.numBonesPerVertex = src.skinning_value.bonesPerVertex;
-      dst.blendWeightBuffer = dxvk::RasterBuffer { blendWeightsSlice, 0, sizeof(float), VK_FORMAT_R32_SFLOAT };
-      dst.blendIndicesBuffer = dxvk::RasterBuffer { blendIndicesSlice, 0, sizeof(uint32_t), VK_FORMAT_R8G8B8A8_USCALED };
+      // Skinning advances by the stride per vertex, so it spans the whole tuple of each vertex.
+      const uint32_t weightStride = src.skinning_value.bonesPerVertex * sizeof(float);
+      const uint32_t indexStride = dxvk::divCeil(src.skinning_value.bonesPerVertex, 4u) * sizeof(uint32_t);
+      dst.blendWeightBuffer = dxvk::RasterBuffer { blendWeightsSlice, 0, weightStride, VK_FORMAT_R32_SFLOAT };
+      dst.blendIndicesBuffer = dxvk::RasterBuffer { blendIndicesSlice, 0, indexStride, VK_FORMAT_R8G8B8A8_USCALED };
     }
 
     dst.indexCount = src.indices_count;
@@ -1098,6 +1121,7 @@ namespace {
       const_cast<bool&>(dxvk::RtxOptions::enableNearPlaneOverride()) = false;
     }
     remixDevice->EmitCs([cRtCamera = convert::toRtCamera(*info)](dxvk::DxvkContext* ctx) {
+      static_cast<dxvk::RtxContext*>(ctx)->prepareScreenResolution();
       ctx->getCommonObjects()->getSceneManager().getCameraManager()
         .processExternalCamera(cRtCamera.type, cRtCamera.worldToView, cRtCamera.viewToProjection);
     });
@@ -1139,6 +1163,43 @@ namespace {
     return REMIXAPI_ERROR_CODE_SUCCESS;
   }
 
+  remixapi_ErrorCode REMIXAPI_CALL remixapi_SetWaterSim(
+    const remixapi_WaterSimInfo* info) {
+    if (!info || info->sType != REMIXAPI_STRUCT_TYPE_WATER_SIM_INFO) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+    dxvk::D3D9DeviceEx* remixDevice = tryAsDxvk();
+    if (!remixDevice) {
+      return REMIXAPI_ERROR_CODE_REMIX_DEVICE_WAS_NOT_REGISTERED;
+    }
+    std::lock_guard lock { s_mutex };
+    remixDevice->EmitCs([cInfo = *info](dxvk::DxvkContext* ctx) {
+      ctx->getCommonObjects()->metaWaterSim().setState(cInfo);
+    });
+    return REMIXAPI_ERROR_CODE_SUCCESS;
+  }
+
+  remixapi_ErrorCode REMIXAPI_CALL remixapi_AddWaterDisturbance(
+    const remixapi_WaterDisturbanceInfo* info) {
+    if (!info || info->sType != REMIXAPI_STRUCT_TYPE_WATER_DISTURBANCE_INFO) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+    // A NaN or infinity in the height field would never decay.
+    if (!std::isfinite(info->position.x) || !std::isfinite(info->position.y) || !std::isfinite(info->position.z) ||
+        !std::isfinite(info->radius) || !std::isfinite(info->strength)) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+    dxvk::D3D9DeviceEx* remixDevice = tryAsDxvk();
+    if (!remixDevice) {
+      return REMIXAPI_ERROR_CODE_REMIX_DEVICE_WAS_NOT_REGISTERED;
+    }
+    std::lock_guard lock { s_mutex };
+    remixDevice->EmitCs([cInfo = *info](dxvk::DxvkContext* ctx) {
+      ctx->getCommonObjects()->metaWaterSim().addDisturbance(cInfo);
+    });
+    return REMIXAPI_ERROR_CODE_SUCCESS;
+  }
+
   remixapi_ErrorCode REMIXAPI_CALL remixapi_DrawInstance(
     const remixapi_InstanceInfo* info) {
     dxvk::D3D9DeviceEx* remixDevice = tryAsDxvk();
@@ -1146,6 +1207,22 @@ namespace {
       return REMIXAPI_ERROR_CODE_REMIX_DEVICE_WAS_NOT_REGISTERED;
     }
     ScopedCpuProfileZone();
+
+    if (auto distribution = pnext::find<remixapi_InstanceInfoParticleSpawnDistributionEXT>(info)) {
+      if (distribution->spawnDistribution != REMIXAPI_PARTICLE_SPAWN_DISTRIBUTION_BY_TRIANGLE
+          && distribution->spawnDistribution != REMIXAPI_PARTICLE_SPAWN_DISTRIBUTION_BY_SURFACE_AREA) {
+        return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+      }
+    }
+    if (auto screenSize = pnext::find<remixapi_InstanceInfoParticleScreenSizeEXT>(info)) {
+      if (!std::isfinite(screenSize->minScreenSize) || screenSize->minScreenSize < 0.f
+          || !std::isfinite(screenSize->maxScreenSize) || screenSize->maxScreenSize < 0.f
+          || (screenSize->maxScreenSize > 0.f && screenSize->maxScreenSize < screenSize->minScreenSize)
+          || !std::isfinite(screenSize->screenSizeCoverage)
+          || screenSize->screenSizeCoverage < 0.f || screenSize->screenSizeCoverage > 1.f) {
+        return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+      }
+    }
 
     // Hoist conversion outside of mutex
     auto drawState = convert::toRtDrawState(*info);
@@ -1476,9 +1553,10 @@ namespace {
     return REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
   }
 
-  remixapi_ErrorCode REMIXAPI_CALL remixapi_dxvk_CopyRenderingOutput(
+  remixapi_ErrorCode copyRenderingOutput(
     IDirect3DSurface9* destination,
-    remixapi_dxvk_CopyRenderingOutputType type) {
+    remixapi_dxvk_CopyRenderingOutputType type,
+    bool copyOnPresent) {
     dxvk::D3D9DeviceEx* remixDevice = tryAsDxvk();
     if (!remixDevice) {
       return REMIXAPI_ERROR_CODE_REMIX_DEVICE_WAS_NOT_REGISTERED;
@@ -1511,6 +1589,10 @@ namespace {
     case REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_DEPTH:
     case REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_NORMALS:
     case REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_OBJECT_PICKING:
+    case REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_WORLD_POSITION_RAW:
+    case REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_TEXCOORDS_RAW:
+    case REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_NORMAL_F32:
+    case REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_COVERAGE:
       break;
     case REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_GUI:
       if (!dxvk::ImGUI::enableExternalPresenter()) {
@@ -1529,12 +1611,10 @@ namespace {
     dxvk::D3D9Surface* backBufferSurface = static_cast<dxvk::D3D9Surface*>(pSurface);
     dxvk::Rc<dxvk::DxvkImage> backbuffer0 = backBufferSurface->GetCommonTexture()->GetImage();
 
-    remixDevice->EmitCs([cDest = std::move(destImage), 
+    auto copyTask = [cDest = std::move(destImage),
                          cDestView = std::move(destImageView),
                          cBackbuffer = std::move(backbuffer0),
-                         type = type] (dxvk::DxvkContext* dxvkCtx) {
-      auto* ctx = static_cast<dxvk::RtxContext*>(dxvkCtx);
-
+                         type = type] (dxvk::DxvkContext* ctx) {
       dxvk::Resources& resourceManager = ctx->getCommonObjects()->getResources();
       const dxvk::Resources::RaytracingOutput& rtOutput = resourceManager.getRaytracingOutput();
 
@@ -1566,6 +1646,18 @@ namespace {
 
         break;
       }
+      case REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_WORLD_POSITION_RAW:
+        srcImage = rtOutput.m_primaryWorldPositionRaw.image;
+        break;
+      case REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_TEXCOORDS_RAW:
+        srcImage = rtOutput.m_primaryTexcoordsRaw.image;
+        break;
+      case REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_NORMAL_F32:
+        srcImage = rtOutput.m_primaryNormalF32.image;
+        break;
+      case REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_COVERAGE:
+        srcImage = rtOutput.m_primaryCoverage.image;
+        break;
       default:
         assert(!"unexpected remixapi_dxvk_CopyRenderingOutputType value");
         return;
@@ -1574,11 +1666,24 @@ namespace {
       if (srcImage.ptr()) {
         dxvk::RtxContext::blitImageHelper(ctx, srcImage, cDest, VkFilter::VK_FILTER_NEAREST);
       }
-    });
+    };
+
+    auto* presenter = remixDevice->GetExternalPresenter();
+    if (copyOnPresent && presenter) {
+      presenter->queuePresentTask(std::move(copyTask));
+    } else {
+      remixDevice->EmitCs(std::move(copyTask));
+    }
 
 #pragma warning(pop)
 
     return REMIXAPI_ERROR_CODE_SUCCESS;
+  }
+
+  remixapi_ErrorCode REMIXAPI_CALL remixapi_dxvk_CopyRenderingOutput(
+    IDirect3DSurface9* destination,
+    remixapi_dxvk_CopyRenderingOutputType type) {
+    return copyRenderingOutput(destination, type, false);
   }
 
 
@@ -1696,6 +1801,9 @@ namespace {
 
   remixapi_ErrorCode REMIXAPI_CALL remixapi_Shutdown(void) {
     if (s_dxvkDevice) {
+      if (dxvk::D3D9SwapchainExternal* presenter = s_dxvkDevice->GetExternalPresenter()) {
+        presenter->clearPresentTasks();
+      }
       dxvk::g_dxvkDeviceNative = nullptr;
       while (true) {
         ULONG left = s_dxvkDevice->Release();
@@ -1769,29 +1877,36 @@ namespace {
   bool isVersionCompatible(uint64_t userVersion) {
     constexpr uint64_t compiledVersion = REMIXAPI_VERSION_MAKE(REMIXAPI_VERSION_MAJOR, REMIXAPI_VERSION_MINOR, REMIXAPI_VERSION_PATCH);
 
-    bool isDevelopment = 
-      REMIXAPI_VERSION_GET_MAJOR(userVersion) == 0 &&
-      REMIXAPI_VERSION_GET_MAJOR(compiledVersion) == 0;
-
-    if (isDevelopment) {
-      // each minor change is breaking
-      return REMIXAPI_VERSION_GET_MINOR(userVersion) == REMIXAPI_VERSION_GET_MINOR(compiledVersion);
-    }
-
-    if (REMIXAPI_VERSION_GET_MAJOR(userVersion) == REMIXAPI_VERSION_GET_MAJOR(compiledVersion)) {
-      // user version must be before the currently compiled version:
-      // features that are requested by a user must be available in the current binary
-      if (REMIXAPI_VERSION_GET_MINOR(userVersion) <= REMIXAPI_VERSION_GET_MINOR(compiledVersion)) {
-        return true;
-      }
-    }
-
-    return false;
+    return remixapi_version::isClientVersionCompatible(userVersion, compiledVersion);
   }
 }
 
 extern "C"
 {
+  // HdRemix queues its bound AOV copies before Present so the completion signal includes them.
+  REMIXAPI remixapi_ErrorCode REMIXAPI_CALL remixinternal_QueueAovCopy(
+    IDirect3DSurface9* destination, remixapi_dxvk_CopyRenderingOutputType type) {
+    return copyRenderingOutput(destination, type, true);
+  }
+
+  REMIXAPI remixapi_ErrorCode REMIXAPI_CALL remixinternal_SetAovRequests(uint32_t raw, uint32_t coverage) {
+    static_assert(kRawAovWorldPosition == (1u << REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_WORLD_POSITION_RAW));
+    static_assert(kRawAovTexcoords == (1u << REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_TEXCOORDS_RAW));
+    static_assert(kRawAovNormal == (1u << REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_NORMAL_F32));
+    if ((raw & ~kRawAovAll) || coverage > 1) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+    std::lock_guard lock { s_mutex };
+    auto* device = tryAsDxvk();
+    if (!device) {
+      return REMIXAPI_ERROR_CODE_REMIX_DEVICE_WAS_NOT_REGISTERED;
+    }
+    device->EmitCs([raw, coverage](dxvk::DxvkContext* ctx) {
+      ctx->getCommonObjects()->getResources().setAovRequests(raw, coverage);
+    });
+    return REMIXAPI_ERROR_CODE_SUCCESS;
+  }
+
   REMIXAPI remixapi_ErrorCode REMIXAPI_CALL remixapi_InitializeLibrary(const remixapi_InitializeLibraryInfo* info,
                                                                        remixapi_Interface* out_result) {
     if (!info || info->sType != REMIXAPI_STRUCT_TYPE_INITIALIZE_LIBRARY_INFO) {
@@ -1803,6 +1918,7 @@ extern "C"
     if (!isVersionCompatible(info->version)) {
       return REMIXAPI_ERROR_CODE_INCOMPATIBLE_VERSION;
     }
+    // The version is process-global, so the most recent initialize wins.
     s_apiVersion = info->version;
 
     auto interf = remixapi_Interface {};
@@ -1816,6 +1932,8 @@ extern "C"
       interf.DestroyMesh = remixapi_DestroyMesh;
       interf.SetupCamera = remixapi_SetupCamera;
       interf.SetCameraMediumMaterial = remixapi_SetCameraMediumMaterial;
+      interf.SetWaterSim = remixapi_SetWaterSim;
+      interf.AddWaterDisturbance = remixapi_AddWaterDisturbance;
       interf.DrawInstance = remixapi_DrawInstance;
       interf.CreateLight = remixapi_CreateLight;
       interf.DestroyLight = remixapi_DestroyLight;
@@ -1830,9 +1948,9 @@ extern "C"
       interf.pick_RequestObjectPicking = remixapi_pick_RequestObjectPicking;
       interf.pick_HighlightObjects = remixapi_pick_HighlightObjects;
     }
-    static_assert(sizeof(interf) == 176, "Add/remove function registration");
+    static_assert(sizeof(interf) == 192, "Add/remove function registration");
 
-    *out_result = interf;
+    remixapi_version::writeClientInterface(interf, info->version, out_result);
     return REMIXAPI_ERROR_CODE_SUCCESS;
   }
 

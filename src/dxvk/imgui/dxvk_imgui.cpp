@@ -197,6 +197,7 @@ namespace dxvk {
     {"decaltextures", "Decal Texture (optional)", &RtxOptions::decalTexturesObject()},
     {"terraintextures", "Terrain Texture", &RtxOptions::terrainTexturesObject()},
     {"watertextures", "Water Texture (optional)", &RtxOptions::animatedWaterTexturesObject()},
+    {"sludgetextures", "Sludge Texture (optional)", &RtxOptions::sludgeTexturesObject()},
     {"antiCullingTextures", "Anti-Culling Texture (optional)", &RtxOptions::antiCullingTexturesObject()},
     {"motionBlurMaskOutTextures", "Motion Blur Mask-Out Textures (optional)", &RtxOptions::motionBlurMaskOutTexturesObject()},
     {"playermodeltextures", "Player Model Texture (optional)", &RtxOptions::playerModelTexturesObject()},
@@ -545,7 +546,7 @@ namespace dxvk {
   constexpr ImGuiWindowFlags popupWindowFlags = ImGuiWindowFlags_NoSavedSettings;
 
   RemixGui::ComboWithKey<UpscalerType>& getUpscalerCombo(DxvkDLSS& dlss, DxvkRayReconstruction& rayReconstruction) {
-    if (dlss.supportsDLSS()) {
+    if (!dlss.isSupportChecked() || dlss.supportsDLSS()) {
       return upscalerDLSSCombo;
     } else {
       // Drop DLSS item if unsupported.
@@ -2469,7 +2470,10 @@ namespace dxvk {
 
       // Lazily create the tex ID ImGUI wants
       if (texImgui.texID == VK_NULL_HANDLE) {
-        texImgui.texID = ImGui_ImplDxvk::AddTexture(nullptr, texImgui.imageView);
+        // Nearest magnification keeps small textures legible, and linear minification keeps large textures smooth.
+        const Rc<DxvkSampler> thumbnailSampler = common->getResources().getSampler(VK_FILTER_NEAREST, VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST,
+          VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
+        texImgui.texID = ImGui_ImplDxvk::AddTexture(thumbnailSampler, texImgui.imageView);
 
         if (texImgui.texID == VK_NULL_HANDLE) {
           ONCE(Logger::err("Failed to allocate ImGUI handle for texture, likely because we're trying to render more textures than VkDescriptorPoolCreateInfo::maxSets.  As such, we will truncate the texture list to show only what we can."));
@@ -2921,6 +2925,7 @@ namespace dxvk {
         RemixGui::Checkbox("Pre-Transformed Vertices Is UI", &D3D9Rtx::preTransformedVerticesIsUIObject());
         RemixGui::Checkbox("Allow Cubemaps", &D3D9Rtx::allowCubemapsObject());
         RemixGui::Checkbox("Always Calculate AABB (For Instance Matching)", &RtxOptions::enableAlwaysCalculateAABBObject());
+        RemixGui::Checkbox("Assume World-Space Skinned Bones", &RtxOptions::assumeWorldSpaceSkinnedBonesObject());
         RemixGui::Checkbox("Skip Sky Fog Values", &RtxOptions::fogIgnoreSkyObject());
         RemixGui::Checkbox("Recompute Texture Hash On Write", &RtxOptions::recomputeTextureHashOnWriteObject());
         ImGui::Unindent();
@@ -2999,10 +3004,12 @@ namespace dxvk {
         ImGui::BeginDisabled(!RtxOptions::Eye::enable());
         RemixGui::Checkbox("Detect texture-generation draw call as Eye", &RtxOptions::Eye::assumeViewTexgenModeAsEyeObject());
         RemixGui::DragFloat("Eye Whites Albedo Scale", &RtxOptions::Eye::eyeWhitesAlbedoScaleObject(), 0.01F);
+        RemixGui::DragFloat("Roughness", &RtxOptions::Eye::roughnessObject(), 0.01F, 0.F, 1.F);
         RemixGui::DragFloat("Normals: Eyeball Offset", &RtxOptions::Eye::eyeballSphereOffsetObject(), 0.001F);
         RemixGui::DragFloat("Normals: Cornea Offset", &RtxOptions::Eye::corneaSphereOffsetObject(), 0.001F);
         RemixGui::DragFloat("Iris Radius", &RtxOptions::Eye::irisRadiusObject(), 0.001F);
-        RemixGui::DragFloat("Iris Depth", &RtxOptions::Eye::irisDepthObject(), 0.001F);
+        RemixGui::DragFloat("Iris Depth Scale", &RtxOptions::Eye::irisDepthScaleObject(), 0.01F);
+        RemixGui::DragFloat("Limbal Ring Scale", &RtxOptions::Eye::limbalRingScaleObject(), 0.01F, 0.F, 1.F);
         ImGui::EndDisabled();
         ImGui::Unindent();
       }
@@ -3863,7 +3870,7 @@ namespace dxvk {
 
       RtxOptions::updatePresetFromUpscaler();
 
-      if (RtxOptions::upscalerType() == UpscalerType::DLSS && !ctx->getCommonObjects()->metaDLSS().supportsDLSS()) {
+      if (dlss.isSupportChecked() && RtxOptions::upscalerType() == UpscalerType::DLSS && !dlss.supportsDLSS()) {
         RtxOptions::upscalerType.setDeferred(UpscalerType::TAAU);
       }
 
@@ -4596,10 +4603,17 @@ namespace dxvk {
       RemixGui::Checkbox("Enable NEE Cache", &RtxOptions::Displacement::enableNEECacheObject());
       RemixGui::Checkbox("Enable ReSTIR_GI", &RtxOptions::Displacement::enableReSTIRGIObject());
       RemixGui::Checkbox("Enable PSR", &RtxOptions::Displacement::enablePSRObject());
+      RemixGui::Checkbox("Silhouettes Behind Translucency", &RtxOptions::Displacement::silhouettesBehindTranslucencyObject());
       RemixGui::DragFloat("Global Displacement Factor", &RtxOptions::Displacement::displacementFactorObject(), 0.01f, 0.0f, 20.0f);
       RemixGui::DragFloat("Displacement In Factor", &RtxOptions::Displacement::displacementInFactorObject(), 0.01f, 0.0f, 20.0f);
       RemixGui::DragFloat("Displacement Out Factor", &RtxOptions::Displacement::displacementOutFactorObject(), 0.01f, 0.0f, 20.0f);
       RemixGui::DragInt("Max Iterations", &RtxOptions::Displacement::maxIterationsObject(), 1.f, 1, 256, "%d", sliderFlags);
+      ImGui::Unindent();
+    }
+
+    if (RemixGui::CollapsingHeader("Water Simulation [Experimental]", collapsingHeaderClosedFlags)) {
+      ImGui::Indent();
+      common->metaWaterSim().showImguiSettings();
       ImGui::Unindent();
     }
 

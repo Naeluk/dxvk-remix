@@ -37,10 +37,10 @@ struct GpuParticle {
   f16vec4 uvMinMax;
   half rotation;
   half timeToLive;
-  half pad0;
-  half pad1;
+  uint emitterObjectPickingValue;
 
   const static uint16_t kDeadTimeToLiveSentinel = 0x7C00;
+  const static uint16_t kRejectedSpawnRotationSentinel = 0x7E00;
 
 #ifdef __cplusplus
   // This ensures that `timeToLive` is initialized with the correct value.
@@ -66,8 +66,18 @@ struct GpuParticle {
     return timeToLive == reinterpret<half>(kDeadTimeToLiveSentinel);
   }
 
+  // Rejected slots retain their normal age for conservative ring retirement.
+  [mutating]
+  void rejectSpawn() {
+    rotation = reinterpret<half>(kRejectedSpawnRotationSentinel);
+  }
+
+  bool isSpawnRejected() {
+    return reinterpret<uint16_t>(rotation) == kRejectedSpawnRotationSentinel;
+  }
+
   bool isSleeping() {
-    return timeToLive <= 0;
+    return timeToLive <= 0 || isSpawnRejected();
   }
 
   float16_t initialTimeToLive(GpuParticleSystem system) {
@@ -115,10 +125,13 @@ struct ParticleVertex {
 #define PARTICLE_SYSTEM_BINDING_PREV_PRIMARY_SCREEN_SPACE_MOTION_INPUT 54
 #define PARTICLE_SYSTEM_BINDING_PARTICLES_BUFFER_INPUT                 55
 #define PARTICLE_SYSTEM_BINDING_ANIMATION_DATA_INPUT                   56
+#define PARTICLE_SYSTEM_BINDING_SPAWN_DISTRIBUTION_INPUT               57
 
 #define PARTICLE_SYSTEM_BINDING_PARTICLES_BUFFER_INPUT_OUTPUT  60
 #define PARTICLE_SYSTEM_BINDING_VERTEX_BUFFER_OUTPUT           61
 #define PARTICLE_SYSTEM_BINDING_COUNTER_OUTPUT                 62
+#define PARTICLE_SYSTEM_BINDING_SPAWN_DISTRIBUTION_OUTPUT        63
+#define PARTICLE_SYSTEM_BINDING_OBJECT_PICKING_OUTPUT          64
 
 #define PARTICLE_SYSTEM_MIN_BINDING                           PARTICLE_SYSTEM_BINDING_CONSTANTS
 

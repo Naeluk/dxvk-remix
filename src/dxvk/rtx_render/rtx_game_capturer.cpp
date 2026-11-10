@@ -52,6 +52,7 @@
 
 #include "../util/util_global_time.h"
 
+#include <cstring>
 #include <filesystem>
 
 #define BASE_DIR (util::RtxFileSys::path(util::RtxFileSys::Captures).string())
@@ -121,8 +122,10 @@ namespace dxvk {
     , m_exporter(exporter)
     , m_options{ getOptions() } {
 
-    if(!env::getEnvVar("DXVK_RTX_CAPTURE_ENABLE_ON_FRAME").empty()) {
-      Logger::info(str::format("[GameCapturer] DXVK_RTX_CAPTURE_ENABLE_ON_FRAME: ", env::getEnvVar("DXVK_RTX_CAPTURE_ENABLE_ON_FRAME")));
+    const std::string captureOnFrame = env::getEnvVar("DXVK_RTX_CAPTURE_ENABLE_ON_FRAME");
+    if (!captureOnFrame.empty()) {
+      Logger::info(str::format("[GameCapturer] DXVK_RTX_CAPTURE_ENABLE_ON_FRAME: ", captureOnFrame));
+      m_scheduledCaptureFrameId = static_cast<uint32_t>(std::stoul(captureOnFrame));
     }
     env::createDirectory(BASE_DIR);
     env::createDirectory(BASE_DIR + lss::commonDirName::texDir);
@@ -153,18 +156,61 @@ namespace dxvk {
     m_pCap->instanceFlags[rtInstance.getId()] |= (1 << uint8_t(flag));
   }
 
-  void GameCapturer::trigger(const Rc<DxvkContext> ctx) {
-    if (m_bTriggerCapture) {
-      m_bTriggerCapture = false;
-      if(isIdle()) {
-        if (RtxOptions::getEnableAnyReplacements()) {
-          Logger::warn("[GameCapturer] Cannot begin capture while replacement assets are enabled.");
-        } else if (m_state.has<State::Capturing>()) {
-          Logger::warn("[GameCapturer] Cannot begin new capture, one currently in progress.");
-        } else {
-          m_state.set<State::Initializing, true>();
-        }
+  void GameCapturer::triggerNewCapture() {
+    if (RtxOptions::getEnableAnyReplacements()) {
+      Logger::warn("[GameCapturer] Cannot begin capture while replacement assets are enabled.");
+      return;
+    }
+    if (!m_bTriggerCapture.exchange(true)) {
+      Logger::info("[GameCapturer] Capture requested.");
+    }
+  }
+
+  void GameCapturer::triggerScheduledCapture(const uint32_t frameId) {
+    if (m_scheduledCaptureFrameId.has_value() && frameId >= *m_scheduledCaptureFrameId) {
+      m_scheduledCaptureFrameId.reset();
+      triggerNewCapture();
+    }
+  }
+
+  void GameCapturer::reportPendingCaptureBlocked(const char* reason) {
+    if (!m_bTriggerCapture) {
+      return;
+    }
+    for (const char* loggedReason : m_loggedCaptureBlockedReasons) {
+      if (std::strcmp(loggedReason, reason) == 0) {
+        return;
       }
+    }
+    m_loggedCaptureBlockedReasons.push_back(reason);
+    Logger::warn(str::format("[GameCapturer] Capture request is pending and cannot start yet: ", reason, "."));
+  }
+
+  void GameCapturer::cancelPendingCapture(const std::string& cause) {
+    if (!m_bTriggerCapture.exchange(false)) {
+      return;
+    }
+    std::string blockedReasons;
+    for (const char* loggedReason : m_loggedCaptureBlockedReasons) {
+      blockedReasons += blockedReasons.empty() ? loggedReason : str::format("; ", loggedReason);
+    }
+    m_loggedCaptureBlockedReasons.clear();
+    Logger::warn(str::format("[GameCapturer] Pending capture request cancelled: ", cause, ". Blocking reasons: ",
+                             blockedReasons.empty() ? "none reported" : blockedReasons, "."));
+  }
+
+  void GameCapturer::trigger(const Rc<DxvkContext> ctx) {
+    if (!m_bTriggerCapture.exchange(false)) {
+      return;
+    }
+    m_loggedCaptureBlockedReasons.clear();
+
+    if (!isIdle()) {
+      Logger::warn("[GameCapturer] Cannot begin new capture, one currently in progress.");
+    } else if (RtxOptions::getEnableAnyReplacements()) {
+      Logger::warn("[GameCapturer] Cannot begin capture while replacement assets are enabled.");
+    } else {
+      m_state.set<State::Initializing, true>();
     }
   }
 
@@ -411,6 +457,11 @@ namespace dxvk {
       }
       assert(instanceId != UINT64_MAX);
 
+      // Remix API draws are mod content with per-session geometry hashes and no legacy game material, so they are not captured.
+      if (pRtInstance->getBlas()->input.isExternalDraw) {
+        continue;
+      }
+
       if (pRtInstance->getBlas()->input.cameraType == CameraType::Sky) {
         if (!m_pCap->bSkyProbeBaked) {
           const std::string skyProbeFilename = getBakedSkyProbeName(m_pCap->instance.stageName);
@@ -465,15 +516,16 @@ namespace dxvk {
   void GameCapturer::newInstance(const Rc<DxvkContext> ctx, const RtInstance& rtInstance) {
     const BlasEntry* pBlas = rtInstance.getBlas();
     assert(pBlas != nullptr);
-    const XXH64_hash_t matHash = rtInstance.getMaterialDataHash();
+    const XXH64_hash_t legacyMatHash = rtInstance.getMaterialDataHash();
     const XXH64_hash_t meshHash = pBlas->input.getHash(RtxOptions::geometryAssetHashRule());
     assert(meshHash != 0);
 
-    const LegacyMaterialData& material = pBlas->getMaterialData(matHash);
+    const LegacyMaterialData& material = pBlas->getMaterialData(legacyMatHash);
+    const XXH64_hash_t matHash = pBlas->input.getCapturedMaterialHash(legacyMatHash);
 
     const bool bIsNewMat = (matHash != 0x0) && (m_pCap->materials.count(matHash) == 0);
     if (bIsNewMat) {
-      captureMaterial(ctx, material, !rtInstance.surface.alphaState.isFullyOpaque);
+      captureMaterial(ctx, material, matHash, !rtInstance.surface.alphaState.isFullyOpaque);
     }
 
     bool bIsNewMesh = false;
@@ -502,11 +554,12 @@ namespace dxvk {
     Logger::debug("[GameCapturer][" + m_pCap->idStr + "][Inst:" + hashToString(instanceId) + "] New");
   }
 
-  void GameCapturer::captureMaterial(const Rc<DxvkContext> ctx, const LegacyMaterialData& materialData, const bool bEnableOpacity) {
+  void GameCapturer::captureMaterial(const Rc<DxvkContext> ctx, const LegacyMaterialData& materialData,
+                                   const XXH64_hash_t materialHash, const bool bEnableOpacity) {
     lss::Material lssMat; // to be populated
 
     // Resolve material name
-    const std::string matName = dxvk::hashToString(materialData.getHash());
+    const std::string matName = dxvk::hashToString(materialHash);
     lssMat.matName = matName;
     // Export Textures
     const std::string albedoTexFilename(matName + lss::ext::dds);
@@ -525,7 +578,7 @@ namespace dxvk {
     lssMat.sampler.borderColor = samplerCreateInfo.borderColor;
 
     // Set populated LSS Material in our cache
-    m_pCap->materials[materialData.getHash()].lssData = lssMat;
+    m_pCap->materials[materialHash].lssData = lssMat;
     Logger::debug("[GameCapturer][" + m_pCap->idStr + "][Mat:" + matName + "] New");
   }
 
@@ -574,9 +627,7 @@ namespace dxvk {
         const InstanceCategories flag = (InstanceCategories) i;
         const bool isSet = flags.test(flag);
 
-        // Keep Hair Cards absent from captured categoryFlags when false instead of authoring an explicit false value.
-        // This preserves existing captures while true hair-card instances still store the category explicitly.
-        if (flag == InstanceCategories::HairCards && !isSet) {
+        if (!isSet && !isCategoryCapturedWhenFalse(flag)) {
           continue;
         }
 

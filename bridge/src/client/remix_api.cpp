@@ -27,6 +27,7 @@
 #include "util_bridgecommand.h"
 #include "util_devicecommand.h"
 #include "util_remixapi.h"
+#include "../../../src/util/util_remix_api_version.h"
 
 using namespace remixapi::util;
 
@@ -42,16 +43,7 @@ bool isRemixApiVersionCompatible(uint64_t appVersion) {
     REMIXAPI_VERSION_MINOR,
     REMIXAPI_VERSION_PATCH);
 
-  const bool isDevelopment =
-    REMIXAPI_VERSION_GET_MAJOR(appVersion) == 0 &&
-    REMIXAPI_VERSION_GET_MAJOR(kCompiledVersion) == 0;
-
-  if (isDevelopment) {
-    return REMIXAPI_VERSION_GET_MINOR(appVersion) == REMIXAPI_VERSION_GET_MINOR(kCompiledVersion);
-  }
-
-  return REMIXAPI_VERSION_GET_MAJOR(appVersion) == REMIXAPI_VERSION_GET_MAJOR(kCompiledVersion) &&
-         REMIXAPI_VERSION_GET_MINOR(appVersion) <= REMIXAPI_VERSION_GET_MINOR(kCompiledVersion);
+  return remixapi_version::isClientVersionCompatible(appVersion, kCompiledVersion);
 }
 
 }
@@ -273,6 +265,13 @@ remixapi_ErrorCode REMIXAPI_CALL remixapi_DrawInstance(const remixapi_InstanceIn
           serializeAndSend<serialize::InstanceInfoObjectPicking>(c, *pObjectPicking);
           break;
         }
+        case REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_PARTICLE_OBJECT_PICKING_EXT:
+        {
+          auto* pParticlePicking = static_cast<const remixapi_InstanceInfoParticleObjectPickingEXT* const>(infoItr);
+          send(c, Bool::True);
+          serializeAndSend<serialize::InstanceInfoParticleObjectPicking>(c, *pParticlePicking);
+          break;
+        }
         case REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_BLEND_EXT:
         {
           auto* pBlend = static_cast<const remixapi_InstanceInfoBlendEXT* const>(infoItr);
@@ -292,6 +291,20 @@ remixapi_ErrorCode REMIXAPI_CALL remixapi_DrawInstance(const remixapi_InstanceIn
           auto* pParticle = static_cast<const remixapi_InstanceInfoParticleSystemEXT* const>(infoItr);
           send(c, Bool::True);
           serializeAndSend<serialize::InstanceInfoParticleSystem>(c, *pParticle);
+          break;
+        }
+        case REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_PARTICLE_SPAWN_DISTRIBUTION_EXT:
+        {
+          auto* pDistribution = static_cast<const remixapi_InstanceInfoParticleSpawnDistributionEXT* const>(infoItr);
+          send(c, Bool::True);
+          serializeAndSend<serialize::InstanceInfoParticleSpawnDistribution>(c, *pDistribution);
+          break;
+        }
+        case REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_PARTICLE_SCREEN_SIZE_EXT:
+        {
+          auto* pScreenSize = static_cast<const remixapi_InstanceInfoParticleScreenSizeEXT* const>(infoItr);
+          send(c, Bool::True);
+          serializeAndSend<serialize::InstanceInfoParticleScreenSize>(c, *pScreenSize);
           break;
         }
         default:
@@ -432,6 +445,32 @@ remixapi_ErrorCode REMIXAPI_CALL remixapi_SetConfigVariable(const char* var, con
   return REMIXAPI_ERROR_CODE_SUCCESS;
 }
 
+remixapi_ErrorCode REMIXAPI_CALL remixapi_SetWaterSim(const remixapi_WaterSimInfo* info) {
+  ASSERT_REMIXAPI_PFN_TYPE(remixapi_SetWaterSim);
+  if (!info || info->sType != REMIXAPI_STRUCT_TYPE_WATER_SIM_INFO) {
+    return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+  }
+  {
+    ClientMessage c(Commands::RemixApi_SetWaterSim);
+    send(c, info->clearAllDisturbances);
+  }
+  return REMIXAPI_ERROR_CODE_SUCCESS;
+}
+
+remixapi_ErrorCode REMIXAPI_CALL remixapi_AddWaterDisturbance(const remixapi_WaterDisturbanceInfo* info) {
+  ASSERT_REMIXAPI_PFN_TYPE(remixapi_AddWaterDisturbance);
+  if (!info || info->sType != REMIXAPI_STRUCT_TYPE_WATER_DISTURBANCE_INFO) {
+    return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+  }
+  {
+    ClientMessage c(Commands::RemixApi_AddWaterDisturbance);
+    send(c, info->position);
+    send(c, info->radius);
+    send(c, info->strength);
+  }
+  return REMIXAPI_ERROR_CODE_SUCCESS;
+}
+
 remixapi_ErrorCode REMIXAPI_CALL remixapi_dxvk_CreateD3D9(
   remixapi_Bool       editorModeEnabled,
   IDirect3D9Ex**      out_pD3D9) {
@@ -502,7 +541,7 @@ extern "C" {
         return REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
       }
       status = static_cast<remixapi_ErrorCode>(DeviceBridge::get_data());
-      DeviceBridge::pop_front();
+      DeviceBridge::consumeResponse();
     }
     if (status != REMIXAPI_ERROR_CODE_SUCCESS) {
       return status;
@@ -523,6 +562,8 @@ extern "C" {
       interf.DestroyLight = remixapi_DestroyLight;
       interf.DrawLightInstance = remixapi_DrawLightInstance;
       interf.SetConfigVariable = remixapi_SetConfigVariable;
+      interf.SetWaterSim = remixapi_SetWaterSim;
+      interf.AddWaterDisturbance = remixapi_AddWaterDisturbance;
       interf.dxvk_CreateD3D9 = remixapi_dxvk_CreateD3D9;
       interf.dxvk_RegisterD3D9Device = remixapi_dxvk_RegisterD3D9Device;
       // interf.dxvk_GetExternalSwapchain = remixapi_dxvk_GetExternalSwapchain;
@@ -533,7 +574,7 @@ extern "C" {
       // interf.pick_HighlightObjects = remixapi_pick_HighlightObjects;
     }
 
-    *out_result = interf;
+    remixapi_version::writeClientInterface(interf, info->version, out_result);
     remixapi::g_appRemixApiVersion = info->version;
     remixapi::g_bInterfaceInitialized = true;
 
